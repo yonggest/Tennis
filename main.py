@@ -20,10 +20,10 @@ def main():
 
     # YOLO 推断
     detector = YOLODetector(model_paths={
-        1920: 'models/yolo26x-1920.mlpackage',
-        320: 'models/yolo26x-320.mlpackage',
-        160: 'models/yolo26x-160.mlpackage',
-    }, imgsz=1920)
+        960: 'models/yolo26x.pt',
+        320: 'models/yolo26x.pt',
+        160: 'models/yolo26x.pt',
+    })
     player_detections, racket_detections, ball_detections = detector.detect_frames(
         video_frames,
         read_from_stub=False,

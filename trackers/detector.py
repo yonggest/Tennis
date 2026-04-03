@@ -2,12 +2,22 @@ from ultralytics import YOLO
 import pickle
 import time
 import cv2
+import torch
+
+
+def _auto_device():
+    if torch.cuda.is_available():
+        return 'cuda'
+    if torch.backends.mps.is_available():
+        return 'mps'
+    return 'cpu'
 
 
 class YOLODetector:
     """一次推断提取 person、tennis racket、sports ball 三类目标。"""
 
-    def __init__(self, model_paths, conf=0.1, imgsz=960, device='cpu'):
+    def __init__(self, model_paths, conf=0.1, imgsz=960, device=None):
+        device = device or _auto_device()
         # model_paths: {imgsz: path}，主推断用 imgsz 对应的模型
         self.model_paths = model_paths
         self.conf = conf
