@@ -68,7 +68,7 @@ COURT_LINES = [
 ]
 
 
-class TemplateHomographyDetector:
+class CourtDetector:
     """
     接口与其他检测器相同：
         kps = detector.predict(frame)   # shape (28,)

@@ -1,1 +1,0 @@
-from .template_homography_detector import TemplateHomographyDetector
