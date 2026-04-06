@@ -40,7 +40,7 @@ class ObjectsDetector:
 
         player_detections, racket_detections, ball_detections = [], [], []
         total = len(frames)
-        w = len(str(total))
+        nw = len(str(total))
         t0 = time.time()
 
         for i, frame in enumerate(frames):
@@ -48,15 +48,15 @@ class ObjectsDetector:
                    if mask is not None else frame[cy1:cy2, cx1:cx2]
             results = self.model.predict(crop, conf=self.conf, imgsz=self.imgsz,
                                          classes=[0, 38, 32], device=self.device,
-                                         verbose=True)[0]
+                                         verbose=False)[0]
             p, r, b = self._parse(results, offset=(cx1, cy1))
             player_detections.append(p)
             racket_detections.append(r)
             ball_detections.append(b)
             pct = (i + 1) * 100 // total
-            print(f"[  detect] {i+1:>{w}}/{total} frames  ({pct:>3}%)", end='\r', flush=True)
+            print(f"[  detect] {i+1:>{nw}}/{total} frames  ({pct:>3}%)", end='\r', flush=True)
 
-        print(f"[  detect] {total:>{w}}/{total} frames  (100%)  done: {time.time()-t0:>6.1f}s")
+        print(f"[  detect] {total:>{nw}}/{total} frames  (100%)  done: {time.time()-t0:>6.1f}s")
         return player_detections, racket_detections, ball_detections
 
     def _parse(self, results, offset=(0, 0)):

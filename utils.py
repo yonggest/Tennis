@@ -1,6 +1,7 @@
 import cv2
 import os
 import time
+import json
 
 
 def text_params(frame_height, base_height=1080):
@@ -23,16 +24,51 @@ def read_video(video_path):
 
 
 def save_video(frames, path, fps=24):
-    h, w = frames[0].shape[:2]
     out_path = os.path.splitext(path)[0] + '.mp4'
+    h, w = frames[0].shape[:2]
     out = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'avc1'), fps, (w, h))
     total = len(frames)
-    fw = len(str(total))
+    nw = len(str(total))
     t0 = time.time()
     for i, frame in enumerate(frames):
         out.write(frame)
         pct = (i + 1) * 100 // total
-        print(f"[   video] {i+1:>{fw}}/{total} frames  ({pct:>3}%)", end='\r', flush=True)
+        print(f"[   video] {i+1:>{nw}}/{total} frames  ({pct:>3}%)", end='\r', flush=True)
     out.release()
-    print(f"[   video] {total:>{fw}}/{total} frames  (100%)  done: {time.time()-t0:>6.1f}s")
+    print(f"[   video] {total:>{nw}}/{total} frames  (100%)  done: {time.time()-t0:>6.1f}s")
     print(f"[   video] saved → {out_path}", flush=True)
+
+
+def save_coco(frames, players, rackets, balls, path):
+    """将检测结果保存为 COCO JSON 格式。"""
+    CATEGORIES = [
+        {'id': 1, 'name': 'person',        'supercategory': 'person'},
+        {'id': 2, 'name': 'tennis racket', 'supercategory': 'sports'},
+        {'id': 3, 'name': 'sports ball',   'supercategory': 'sports'},
+    ]
+    CAT_ID = {'person': 1, 'tennis racket': 2, 'sports ball': 3}
+
+    fh, fw = frames[0].shape[:2]
+    images, annotations = [], []
+    ann_id = 0
+
+    for frame_id, (p_list, r_list, b_list) in enumerate(zip(players, rackets, balls)):
+        images.append({'id': frame_id, 'width': fw, 'height': fh, 'frame_id': frame_id})
+        for cat_name, dets in [('person', p_list), ('tennis racket', r_list), ('sports ball', b_list)]:
+            for det in dets:
+                x1, y1, x2, y2 = det['bbox']
+                bw, bh = x2 - x1, y2 - y1
+                annotations.append({
+                    'id':          ann_id,
+                    'image_id':    frame_id,
+                    'category_id': CAT_ID[cat_name],
+                    'bbox':        [x1, y1, bw, bh],
+                    'area':        bw * bh,
+                    'iscrowd':     0,
+                    'score':       det['conf'],
+                })
+                ann_id += 1
+
+    with open(path, 'w') as f:
+        json.dump({'images': images, 'annotations': annotations, 'categories': CATEGORIES}, f, indent=2)
+    print(f"[    coco] saved → {path}  ({ann_id} annotations, {len(images)} frames)")
