@@ -32,6 +32,7 @@ def parse_args():
     p.add_argument("--imgsz",  type=int,   default=640,     help="推理图片尺寸")
     p.add_argument("--conf",   type=float, default=0.25,    help="置信度阈值")
     p.add_argument("--device", default="",                  help="'mps'/'cpu'/'0'(CUDA)，留空自动选择")
+    p.add_argument("--limit",  type=int,   default=0,       help="最多评测多少张图片（0 = 全部）")
     if len(sys.argv) == 1:
         p.print_help()
         sys.exit(0)
@@ -105,6 +106,8 @@ def evaluate(model, val_img_dir, val_label_dir, args, gt_names: list[str]):
     gt_counts  = defaultdict(int)    # name → count
 
     img_paths = sorted(p for p in val_img_dir.glob("*") if p.suffix.lower() in IMAGE_EXTS)
+    if args.limit > 0:
+        img_paths = img_paths[:args.limit]
     print(f"评测图片数: {len(img_paths)}")
 
     for img_path in tqdm(img_paths, unit="img"):
