@@ -1,9 +1,9 @@
 """
-用 tennis 数据集微调 YOLO26x 模型。
+用 YOLO 数据集训练模型。
 
 用法:
     python train_yolo.py --data datasets/xxx-yolo/data.yaml
-    python train_yolo.py --data datasets/xxx-yolo/data.yaml --epochs 50 --batch 4 --device mps
+    python train_yolo.py --data datasets/xxx-yolo/data.yaml --name finetune --epochs 50 --batch 4 --device 0
 """
 
 import argparse
@@ -23,8 +23,7 @@ def parse_args():
     p.add_argument("--imgsz",   type=int,   default=1920,    help="输入图片尺寸")
     p.add_argument("--lr0",     type=float, default=0.001,   help="初始学习率（微调时比默认小）")
     p.add_argument("--freeze",  type=int,   default=10,      help="冻结前 N 层 backbone，0=不冻结")
-    p.add_argument("--project", default="finetune",                              help="输出根目录")
-    p.add_argument("--name",    default=None,                                    help="本次训练子目录名（默认按时间戳自动生成）")
+    p.add_argument("--name",    default=None,                help="本次运行名，输出到 runs/{task}/exp/{name}/（默认：{数据集名}-{时间戳}）")
     p.add_argument("--device",  default="",                  help="'mps'/'cpu'/'0'(CUDA)，留空自动选择")
     if len(sys.argv) == 1:
         p.print_help()
@@ -40,9 +39,10 @@ def main():
     if not Path(args.data).exists():
         raise FileNotFoundError(f"找不到数据配置: {args.data}  请先运行 coco2yolo.py 和 split_dataset.py")
 
-    run_name = args.name or datetime.now().strftime("tennis-%Y%m%d-%H%M%S")
-    project_dir = str(Path(__file__).parent / args.project)
+    dataset_name = Path(args.data).parent.name or Path(args.data).stem  # e.g. huanglong-yolo/data.yaml → huanglong-yolo
+    run_name = args.name or f"{dataset_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     model = YOLO(args.model)
+    project_dir = str(Path(__file__).parent / "runs" / model.task / "exp")
 
     results = model.train(
         data=args.data,
@@ -60,7 +60,7 @@ def main():
         device=args.device or None,
         project=project_dir,
         name=run_name,
-        exist_ok=True,
+        exist_ok=False,
         pretrained=True,
         optimizer="AdamW",
         # 数据增强（微调时适度降低）

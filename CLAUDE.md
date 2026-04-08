@@ -30,13 +30,13 @@ python3.10 -m venv .venv
 
 ```bash
 # Fine-tune
-.venv/bin/python train_yolo.py --data datasets/xxx-yolo/data.yaml
+.venv/bin/python train_yolo.py --data datasets/xxx-yolo/data.yaml --name finetune
 
 # Evaluate
 .venv/bin/python eval_yolo.py --data datasets/xxx-yolo/data.yaml
 ```
 
-- Training outputs to `finetune/<timestamp>/` under the project root (absolute path, not affected by ultralytics global `runs_dir` setting)
+- Training outputs to `runs/{task}/exp/<name>/` under the project root (absolute path, not affected by ultralytics global `runs_dir` setting)
 
 ## Architecture
 
