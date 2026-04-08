@@ -1,7 +1,10 @@
-ultralytics
-torch
-torchvision
-opencv-python
-numpy
-pandas
-scipy
+# Python 3.10 required (3.12 不兼容 torch 1.13.1)
+# torch 需单独安装（GTX 1080 Ti sm_61 只支持到 torch 1.13.x）:
+#   pip install torch==1.13.1+cu117 torchvision==0.14.1+cu117 --extra-index-url https://download.pytorch.org/whl/cu117
+torch==1.13.1+cu117
+torchvision==0.14.1+cu117
+ultralytics==8.4.35
+opencv-python==4.13.0.92
+numpy==1.26.4
+pandas==2.3.3
+scipy==1.15.3
