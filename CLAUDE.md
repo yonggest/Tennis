@@ -9,24 +9,34 @@ Computer vision pipeline that analyzes tennis match video: detects players, rack
 ## Running the Pipeline
 
 ```bash
-python main.py
+.venv/bin/python main.py -i <input_video> -m models/yolo26x.pt --imgsz 1920
 ```
 
-- **Input:** `input_videos/input_video.mp4`
-- **Output:** `output_videos/output_video.mp4` (HEVC/H.265, crf=18)
+- **Output:** same directory as input, filename `<input>_out.mp4` (H.264, crf=18)
 - **Required model:** `models/yolo26x.pt` — single model for all three classes
-- **Python env:** `.venv/bin/python`
-
-To skip slow re-inference, set `read_from_stub=True` in `main.py` and use cached detections from:
-- `tracker_stubs/player_racket_ball_detections.pkl`
-
-Default is `read_from_stub=False` (always re-run inference on new input video).
+- **Python env:** `.venv/bin/python` (Python 3.10 required, see Dependencies)
 
 ## Dependencies
 
+GTX 1080 Ti (sm_61) is not supported by PyTorch 2.x. Must use Python 3.10 + torch 1.13.1+cu117:
+
 ```bash
-pip install ultralytics torch pandas numpy opencv-python
+python3.10 -m venv .venv
+.venv/bin/pip install torch==1.13.1+cu117 torchvision==0.14.1+cu117 --extra-index-url https://download.pytorch.org/whl/cu117
+.venv/bin/pip install ultralytics==8.4.35 opencv-python numpy==1.26.4 pandas scipy
 ```
+
+## Training & Evaluation
+
+```bash
+# Fine-tune
+.venv/bin/python train_yolo.py --data datasets/xxx-yolo/data.yaml
+
+# Evaluate
+.venv/bin/python eval_yolo.py --data datasets/xxx-yolo/data.yaml
+```
+
+- Training outputs to `finetune/<timestamp>/` under the project root (absolute path, not affected by ultralytics global `runs_dir` setting)
 
 ## Architecture
 
@@ -34,34 +44,28 @@ pip install ultralytics torch pandas numpy opencv-python
 
 ```
 read_video()
-  → TemplateHomographyDetector (frame 0 only) — 14 court keypoints
-  → YOLODetector.detect_frames() — single model.predict() for person/racket/ball
-  → PlayerTracker.choose_and_filter_players() — pick 4 players, stable IDs via Kalman + Hungarian
-  → RacketTracker.assign_rackets_to_players() — nearest-player assignment
-  → BallTracker.filter_static_detections() — remove stationary false positives
-  → BallTracker.find_ball_by_longest_trajectory() — greedy tracklet, select by movement distance
-  → draw: court keypoints → players → rackets → ball → frame number
-  → save_video() — ffmpeg HEVC encoding
+  → CourtDetector.predict(frame 0) — 14 court keypoints via template homography
+  → ObjectsDetector.run() — single model.predict() for person/racket/ball
+  → hull mask applied to all frames
+  → draw: court hull → players → rackets → balls → frame number
+  → save_video() — ffmpeg H.264 encoding
 ```
 
 ### Key Design Decisions
 
 - **Single inference:** `model.predict()` (not `model.track()`) with `classes=[0, 38, 32]` detects all three classes at once. `track()` was abandoned because ByteTrack drops unconfirmed detections (box.id=None), causing ball loss.
 - **Court keypoints** detected only on frame 0 via template homography — the court doesn't move.
-- **Player stable IDs:** Kalman filter predicts position, Hungarian algorithm matches detections, appearance histogram (HSV 16×16) provides ReID. 4 players selected by proximity to court keypoints.
-- **Ball selection:** First removes detections stationary for ≥10 frames (false positives), then builds greedy tracklets and selects the one with greatest total movement distance.
-- **Output encoding:** ffmpeg libx265, crf=18, preset=fast, tag=hvc1 (required for QuickTime compatibility).
-- **Inference device:** `device='cpu'` by default. MPS tested but slower than CPU for yolo26x on M5.
+- **Valid zone hull:** convex hull of court keypoints used to mask out-of-court regions before detection.
+- **Output encoding:** ffmpeg libx264, crf=18, preset=fast.
+- **Inference device:** auto-selects cuda > cpu. MPS tested but slower than CPU for yolo26x on M5.
 
 ### Module Responsibilities
 
 | Module | Purpose |
 |---|---|
-| `trackers/detector.py` | YOLODetector: single predict() call, stub caching, MPS batch inference |
-| `trackers/player_tracker.py` | Player filtering, stable ID assignment (Kalman + Hungarian + histogram) |
-| `trackers/ball_tracker.py` | Static false positive filter, longest-trajectory selection |
-| `trackers/racket_tracker.py` | Racket-to-player assignment by nearest center distance |
-| `court_line_detector/` | TemplateHomographyDetector → 14 court keypoints (28 floats) |
-| `utils/video_utils.py` | read_video, save_video (ffmpeg HEVC) |
-| `utils/bbox_utils.py` | Geometric helpers (center, distance) |
-| `constants/` | Player colors per ID |
+| `main.py` | Pipeline entry point, CLI args, drawing, video I/O |
+| `objects_detector.py` | ObjectsDetector: single predict() call for person/racket/ball |
+| `court_detector.py` | CourtDetector: template homography → 14 court keypoints, valid zone hull |
+| `utils.py` | read_video, save_video (ffmpeg H.264), save_coco, text_params |
+| `train_yolo.py` | Fine-tune YOLO on tennis dataset |
+| `eval_yolo.py` | Evaluate model with per-class AP metrics |

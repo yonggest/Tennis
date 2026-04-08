@@ -51,7 +51,7 @@ class ObjectsDetector:
                    if mask is not None else frame[cy1:cy2, cx1:cx2]
             results = self.model.predict(crop, conf=self.conf, imgsz=self.imgsz,
                                          classes=self.class_ids, device=self.device,
-                                         verbose=False)[0]
+                                         verbose=False, save=False)[0]
             p, r, b = self._parse(results, offset=(cx1, cy1))
             player_detections.append(p)
             racket_detections.append(r)

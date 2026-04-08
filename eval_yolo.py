@@ -27,7 +27,7 @@ def parse_args():
     p = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--model",  default="models/yolo26x.pt", help="模型权重路径")
+    p.add_argument("--model",  default=str(Path(__file__).parent / "models/yolo26x.pt"), help="模型权重路径")
     p.add_argument("--data",   required=True,               help="数据集配置文件（data.yaml）")
     p.add_argument("--imgsz",  type=int,   default=640,     help="推理图片尺寸")
     p.add_argument("--conf",   type=float, default=0.25,    help="置信度阈值")
@@ -121,7 +121,7 @@ def evaluate(model, val_img_dir, val_label_dir, args, gt_names: list[str]):
 
         result = model.predict(str(img_path), imgsz=args.imgsz,
                                conf=args.conf, device=args.device or None,
-                               verbose=False)[0]
+                               verbose=False, save=False)[0]
         img_h, img_w = result.orig_shape
 
         preds_by_name = defaultdict(list)
@@ -181,7 +181,7 @@ def main():
     with open(args.data) as f:
         cfg = yaml.safe_load(f)
 
-    data_root     = Path(cfg["path"])
+    data_root     = (Path(args.data).parent / cfg["path"]).resolve() if not Path(cfg["path"]).is_absolute() else Path(cfg["path"])
     val_img_dir   = data_root / cfg["val"]
     val_label_dir = find_label_dir(data_root, cfg["val"])
     gt_names      = cfg["names"]
