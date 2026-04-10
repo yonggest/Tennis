@@ -12,7 +12,7 @@ TemplateHomographyDetector
 import cv2
 import numpy as np
 from pathlib import Path
-from scipy.optimize import minimize, differential_evolution
+from scipy.optimize import minimize
 
 # ── 球场尺寸（国际网联标准，米）─────────────────────────────────
 COURT_W     = 10.97
@@ -189,16 +189,19 @@ class CourtDetector:
         return mask
 
     # ── 4. 构建距离场 ──────────────────────────────────────────────
-    def _build_dist_map(self, frame, court_mask, white_thresh=160, cap=None):
+    def _build_dist_map(self, frame, court_mask, cap=None):
         """
         对实际图像中的白线像素直接求距离变换（不做 Canny）。
         每个像素的值 = 到最近白线像素的距离（上限 cap）。
         模板像素落在白线内部或边缘均得到低代价，更鲁棒。
+
+        白线判定：HSV 高亮度（V > 180）+ 低饱和度（S < 50），
+        比单纯灰度阈值更精确，避免把亮色球场地面误判为白线。
         """
         if cap is None:
             cap = frame.shape[0] * 0.046    # ~4.6% 图像高度
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        _, white = cv2.threshold(gray, white_thresh, 255, cv2.THRESH_BINARY)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        white = cv2.inRange(hsv, np.array([0, 0, 180]), np.array([180, 50, 255]))
         white_in = cv2.bitwise_and(white, court_mask)
         dist = cv2.distanceTransform(
                    cv2.bitwise_not(white_in), cv2.DIST_L2, 5)
@@ -298,19 +301,13 @@ class CourtDetector:
               f"f_scale={fs:.2f}", flush=True)
         return best_H if best_H is not None else np.eye(3, dtype=np.float32)
 
-    # ── 6. 优化：角点参数化 + 差分进化全局搜索 + Nelder-Mead 精调 ──
+    # ── 6. 优化：角点参数化 + Nelder-Mead 精调 ──────────────────────
     def _optimize(self, H_hint, dist_map, img_shape):
         """
         把 4 个双打角的图像坐标作为优化变量（8个参数），
-        在合理范围内用差分进化做全局搜索，再用 Nelder-Mead 精调。
-        这样避免直接优化 H 的 9 个参数导致的局部最优问题。
-
-        若 init cost < SKIP_DE_THRESHOLD，跳过 DE，直接用 4 角参数化做
-        Nelder-Mead 精调（避免全局搜索误入虚假最小值）。
+        用 Nelder-Mead 从 YOLO seg 给出的初始 H 精调。
         """
         h_img, w_img = dist_map.shape
-
-        SKIP_DE_THRESHOLD = 5.0   # init cost 低于此值时跳过 DE
 
         # 四个双打角的世界坐标：tl/tr/bl/br
         SRC_M = np.array([[0,       0      ],
@@ -322,23 +319,6 @@ class CourtDetector:
             dst = np.array(params, dtype=np.float32).reshape(4, 2)
             H, _ = cv2.findHomography(SRC_M, dst, method=0)
             return H
-
-        # 为加速差分进化，对模板点降采样
-        idx = np.random.choice(len(self._template_pts_m),
-                               min(3000, len(self._template_pts_m)),
-                               replace=False)
-        pts_sub = self._template_pts_m[idx].reshape(-1, 1, 2)
-
-        def cost_sub(H):
-            proj = cv2.perspectiveTransform(pts_sub, H).reshape(-1, 2)
-            valid = ((proj[:, 0] >= 0) & (proj[:, 0] < w_img - 1) &
-                     (proj[:, 1] >= 0) & (proj[:, 1] < h_img - 1))
-            if valid.sum() < 50:
-                return 1e6
-            p  = proj[valid]
-            xi = np.clip(p[:, 0].astype(np.int32), 0, w_img - 1)
-            yi = np.clip(p[:, 1].astype(np.int32), 0, h_img - 1)
-            return float(dist_map[yi, xi].mean())
 
         def corners_cost(params):
             """4-角参数化代价（含拓扑约束）"""
@@ -358,45 +338,14 @@ class CourtDetector:
                 for i in range(n)))
             if area < 0.05 * w_img * h_img: return 1e6
             H = corners_to_H(params)
-            return 1e6 if H is None else cost_sub(H)
+            return 1e6 if H is None else self._cost(H, dist_map)
 
-        if H_hint is not None:
-            best_H    = H_hint
-            best_cost = self._cost(H_hint, dist_map)
-            print(f"[   court] init H cost: {best_cost:.3f}")
-        else:
-            best_H, best_cost = None, 1e9
-            print("[   court] no init H, DE runs from scratch")
-
-        if best_cost >= SKIP_DE_THRESHOLD:
-            # 全局搜索范围
-            def bx(r): return int(r * w_img)
-            def by(r): return int(r * h_img)
-            BOUNDS = [
-                (bx(0.18), bx(0.42)),  # tl_x
-                (by(0.28), by(0.52)),  # tl_y
-                (bx(0.55), bx(0.86)),  # tr_x
-                (by(0.28), by(0.52)),  # tr_y
-                (0,        bx(0.21)),  # bl_x
-                (by(0.69), by(0.91)),  # bl_y
-                (bx(0.78), bx(1.00)),  # br_x
-                (by(0.69), by(0.91)),  # br_y
-            ]
-            result = differential_evolution(
-                corners_cost, BOUNDS,
-                maxiter=600, popsize=15, tol=0.001,
-                seed=42, workers=1, polish=False,
-                mutation=(0.5, 1.5), recombination=0.7)
-            H_de = corners_to_H(result.x)
-            c_de = self._cost(H_de, dist_map)
-            print(f"[   court] diff-evolution: {c_de:.3f}  ({result.nit} iters)")
-            if c_de < best_cost:
-                best_cost, best_H = c_de, H_de
-        else:
-            print(f"[   court] init cost {best_cost:.3f} < {SKIP_DE_THRESHOLD}, skipping DE")
-
-        if best_H is None:
+        if H_hint is None:
             raise RuntimeError("所有初始化方法均失败，无法检测球场")
+
+        best_H    = H_hint
+        best_cost = self._cost(H_hint, dist_map)
+        print(f"[   court] init H cost: {best_cost:.3f}")
 
         # Nelder-Mead 精调：用 4-角参数化，防止 H 漂移到退化解
         init_corners = cv2.perspectiveTransform(
