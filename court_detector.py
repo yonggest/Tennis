@@ -11,6 +11,7 @@ TemplateHomographyDetector
 """
 import cv2
 import numpy as np
+from pathlib import Path
 from scipy.optimize import minimize, differential_evolution
 
 # ── 球场尺寸（国际网联标准，米）─────────────────────────────────
@@ -75,13 +76,22 @@ class CourtDetector:
         img = detector.draw_keypoints_on_video(frames, kps)
     """
 
-    def __init__(self, scale: int = 40):
+    def __init__(self, scale: int = 40, seg_model: str = None):
         """
         scale: 模板分辨率（像素/米），越大越精细但越慢
+        seg_model: YOLO seg 模型路径，用于检测球场多边形作为初始估计
         """
         self.scale = scale
         # 预计算：模板中所有白线像素的米坐标
         self._template_img, self._template_pts_m = self._build_template(scale)
+
+        # YOLO seg 模型（球场区域检测）
+        self._seg_model = None
+        seg_path = seg_model or str(Path(__file__).parent / 'models/court_seg.pt')
+        if Path(seg_path).exists():
+            from ultralytics import YOLO
+            self._seg_model = YOLO(seg_path, verbose=False)
+            print(f"[   court] court seg model: {seg_path}")
 
     # ── 1. 构建模板 ────────────────────────────────────────────────
     def _build_template(self, scale: int):
@@ -123,7 +133,7 @@ class CourtDetector:
             (xs.astype(np.float32) - pad_px) / scale,
             (ys.astype(np.float32) - pad_px) / scale,
         ])
-        print(f"[template] template white pixels: {len(pts_m)}, "
+        print(f"[   court] template white pixels: {len(pts_m)}, "
               f"size: {W}x{H} px @ {scale}px/m")
         return tmpl, pts_m.astype(np.float32)
 
@@ -132,13 +142,11 @@ class CourtDetector:
         court_mask = self._get_court_mask(frame)
         dist_map   = self._build_dist_map(frame, court_mask)
 
-        # 初始单应矩阵（角点检测）
-        # 用 Hough 角点做初始 H（仅作参考起点，全局搜索不依赖它）
+        # YOLO seg 初始 H + 模板匹配精调
         H_init = self._get_hough_H(frame, court_mask, dist_map)
+        H_opt  = self._optimize(H_init, dist_map, frame.shape)
 
-        # 全局搜索 + 精调
-        H_opt = self._optimize(H_init, dist_map, frame.shape)
-
+        self._init_H = H_init  # 供调试用：优化前的初始估计
         self._last_H = H_opt   # 供调试用
         kps = self._project_keypoints(H_opt, frame.shape)
         return kps.flatten()
@@ -199,21 +207,27 @@ class CourtDetector:
     # ── 5. 代价函数：模板白线像素到实际边缘的平均距离 ─────────────
     def _cost(self, H, dist_map):
         h_img, w_img = dist_map.shape
-        margin = 200  # 允许少量越界
 
         # 检查投影关键点合法性
         kps_m = MODEL_KPS_M.reshape(-1, 1, 2)
         kps_proj = cv2.perspectiveTransform(kps_m, H).reshape(-1, 2)
 
-        # 四个双打角必须严格在图像内（无额外容差）
-        corners = kps_proj[:4]
-        if not (np.all(corners[:, 0] >= 0) and np.all(corners[:, 0] < w_img) and
-                np.all(corners[:, 1] >= 0) and np.all(corners[:, 1] < h_img)):
+        # 远端角点（0,1）必须严格在图像内
+        far_c = kps_proj[:2]
+        if not (np.all(far_c[:, 0] >= 0) and np.all(far_c[:, 0] < w_img) and
+                np.all(far_c[:, 1] >= 0) and np.all(far_c[:, 1] < h_img)):
             return 1e6
 
-        # 远端（y 小）必须在近端（y 大）上方
-        p0, p1, p2, p3 = corners
-        if (p0[1] + p1[1]) / 2 >= (p2[1] + p3[1]) / 2:
+        # 近端角点（2,3）：允许超出图像（俯视时近端底线可能在画面上方以外）
+        # 但不能偏得太远
+        near_c = kps_proj[2:4]
+        nc_m = max(w_img, h_img) * 0.7
+        if not (np.all(near_c[:, 0] > -nc_m) and np.all(near_c[:, 0] < w_img + nc_m) and
+                np.all(near_c[:, 1] > -nc_m) and np.all(near_c[:, 1] < h_img + nc_m)):
+            return 1e6
+
+        # 拓扑：远端必须在近端上方（远端 y 更小 = 图像中更靠上）
+        if far_c[:, 1].mean() >= near_c[:, 1].mean():
             return 1e6
 
         # 主代价：模板白线像素到最近边缘的平均距离
@@ -228,14 +242,86 @@ class CourtDetector:
         yi = np.clip(p[:, 1].astype(np.int32), 0, h_img - 1)
         return float(dist_map[yi, xi].mean())
 
+    # ── 5b. 相机模型初始估计：扫描物理参数 ────────────────────────────
+    def _camera_model_init(self, dist_map, img_shape):
+        """
+        扫描摄像机的物理安装参数（离底线距离、高度、俯仰角、等效焦距），
+        用小孔相机模型生成候选 H，选代价最小的作为优化初始值。
+
+        世界坐标系：x 横向（左→右），y 纵向（远端=0 → 近端=COURT_L），z 竖直向上。
+        摄像机横向居中，位于近端底线之后。
+        """
+        h_img, w_img = img_shape[:2]
+        cx, cy = w_img / 2.0, h_img / 2.0
+        world_up = np.array([0.0, 0.0, 1.0])
+
+        # 扫描范围：离底线距离(m)、离地高度(m)、俯仰角(°)、焦距(× 图像宽度)
+        dists   = [3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        heights = [2.0, 2.5, 3.0, 3.5, 4.0, 4.5]
+        pitches = [8, 10, 12, 15, 18, 20, 22, 25]   # 俯视角（度）
+        f_scales = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.4]
+
+        best_H    = None
+        best_cost = 1e9
+        best_params = (dists[0], heights[0], pitches[0], f_scales[0])
+
+        for dist in dists:
+            for height in heights:
+                cam_pos = np.array([COURT_W / 2, COURT_L + dist, height])
+
+                for pitch_deg in pitches:
+                    pitch = np.radians(pitch_deg)
+                    # 相机朝向：水平向前（-y）+ 俯视（-z）
+                    z_c = np.array([0.0, -np.cos(pitch), -np.sin(pitch)])
+
+                    x_c = np.cross(world_up, z_c)
+                    x_c /= np.linalg.norm(x_c)
+                    y_c = np.cross(x_c, z_c)
+
+                    R = np.array([x_c, y_c, z_c])
+                    t = -R @ cam_pos
+
+                    for f_s in f_scales:
+                        f = f_s * w_img
+                        K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1.0]])
+                        H = (K @ np.column_stack([R[:, 0], R[:, 1], t])).astype(np.float32)
+
+                        c = self._cost(H, dist_map)
+                        if c < best_cost:
+                            best_cost   = c
+                            best_H      = H.copy()
+                            best_params = (dist, height, pitch_deg, f_s)
+
+        d, h, p, fs = best_params
+        print(f"[   court] camera-model scan: cost={best_cost:.3f}  "
+              f"dist={d:.0f}m  height={h:.1f}m  pitch={p:.0f}deg  "
+              f"f_scale={fs:.2f}", flush=True)
+        return best_H if best_H is not None else np.eye(3, dtype=np.float32)
+
     # ── 6. 优化：角点参数化 + 差分进化全局搜索 + Nelder-Mead 精调 ──
     def _optimize(self, H_hint, dist_map, img_shape):
         """
         把 4 个双打角的图像坐标作为优化变量（8个参数），
         在合理范围内用差分进化做全局搜索，再用 Nelder-Mead 精调。
         这样避免直接优化 H 的 9 个参数导致的局部最优问题。
+
+        若 init cost < SKIP_DE_THRESHOLD，跳过 DE，直接用 4 角参数化做
+        Nelder-Mead 精调（避免全局搜索误入虚假最小值）。
         """
         h_img, w_img = dist_map.shape
+
+        SKIP_DE_THRESHOLD = 5.0   # init cost 低于此值时跳过 DE
+
+        # 四个双打角的世界坐标：tl/tr/bl/br
+        SRC_M = np.array([[0,       0      ],
+                          [COURT_W, 0      ],
+                          [0,       COURT_L],
+                          [COURT_W, COURT_L]], dtype=np.float32)
+
+        def corners_to_H(params):
+            dst = np.array(params, dtype=np.float32).reshape(4, 2)
+            H, _ = cv2.findHomography(SRC_M, dst, method=0)
+            return H
 
         # 为加速差分进化，对模板点降采样
         idx = np.random.choice(len(self._template_pts_m),
@@ -254,207 +340,147 @@ class CourtDetector:
             yi = np.clip(p[:, 1].astype(np.int32), 0, h_img - 1)
             return float(dist_map[yi, xi].mean())
 
-        # 仅使用远端底线 + 近端底线的对应关系
-        # （摄像机2米高，从近端拍摄，远近两条底线都可见）
-        SRC_CASES = [
-            np.array([[0,       0      ],
-                      [COURT_W, 0      ],
-                      [0,       COURT_L],
-                      [COURT_W, COURT_L]], dtype=np.float32),
-        ]
+        def corners_cost(params):
+            """4-角参数化代价（含拓扑约束）"""
+            dst = np.array(params, dtype=np.float32).reshape(4, 2)
+            tl, tr, bl, br = dst
+            margin   = int(h_img * 0.046)
+            topo_gap = int(h_img * 0.046)
+            for px, py in [tl, tr, bl, br]:
+                if px < -margin or px > w_img + margin: return 1e6
+                if py < -margin or py > h_img + margin: return 1e6
+            if tl[1] >= bl[1] - topo_gap or tr[1] >= br[1] - topo_gap: return 1e6
+            if tl[0] >= tr[0] - topo_gap or bl[0] >= br[0] - topo_gap: return 1e6
+            poly = np.array([tl, tr, br, bl])
+            n = len(poly)
+            area = 0.5 * abs(sum(
+                poly[i][0] * poly[(i+1) % n][1] - poly[(i+1) % n][0] * poly[i][1]
+                for i in range(n)))
+            if area < 0.05 * w_img * h_img: return 1e6
+            H = corners_to_H(params)
+            return 1e6 if H is None else cost_sub(H)
 
-        # 搜索范围用图像尺寸的比例表达，自动适配任意分辨率
-        def bx(r): return int(r * w_img)
-        def by(r): return int(r * h_img)
-        # [tl_x, tl_y, tr_x, tr_y, bl_x, bl_y, br_x, br_y]
-        BOUNDS = [
-            (bx(0.18), bx(0.42)),   # tl_x  远-左
-            (by(0.28), by(0.52)),   # tl_y  远端底线在上半部
-            (bx(0.55), bx(0.86)),   # tr_x  远-右
-            (by(0.28), by(0.52)),   # tr_y
-            (0,        bx(0.21)),   # bl_x  近-左
-            (by(0.69), by(0.91)),   # bl_y  近端底线靠近下边
-            (bx(0.78), bx(1.00)),   # br_x  近-右
-            (by(0.69), by(0.91)),   # br_y
-        ]
+        if H_hint is not None:
+            best_H    = H_hint
+            best_cost = self._cost(H_hint, dist_map)
+            print(f"[   court] init H cost: {best_cost:.3f}")
+        else:
+            best_H, best_cost = None, 1e9
+            print("[   court] no init H, DE runs from scratch")
 
-        best_H, best_cost = H_hint, self._cost(H_hint, dist_map)
-        print(f"[template] Hough initial cost: {best_cost:.3f}")
-
-        for case_i, src_m in enumerate(SRC_CASES):
-            def corners_to_H(params, _src=src_m):
-                dst = np.array(params, dtype=np.float32).reshape(4, 2)
-                H, _ = cv2.findHomography(_src, dst, method=0)
-                return H
-
-            def de_cost(params, _src=src_m):
-                dst = np.array(params, dtype=np.float32).reshape(4, 2)
-                tl, tr, bl, br = dst  # 顺序: 远左, 远右, 近左, 近右
-
-                # 1. 所有角点在图像范围内
-                margin = int(h_img * 0.046)   # ~4.6% 图像高度
-                for px, py in [tl, tr, bl, br]:
-                    if px < -margin or px > w_img + margin:
-                        return 1e6
-                    if py < -margin or py > h_img + margin:
-                        return 1e6
-
-                # 2. 拓扑正确：远端在近端上方，左边在右边左侧
-                topo_gap = int(h_img * 0.046)   # ~4.6% 图像高度
-                if tl[1] >= bl[1] - topo_gap or tr[1] >= br[1] - topo_gap:
-                    return 1e6
-                if tl[0] >= tr[0] - topo_gap or bl[0] >= br[0] - topo_gap:
-                    return 1e6
-
-                # 3. 用 shoelace 公式算四边形面积（按顺序 tl→tr→br→bl）
-                poly = np.array([tl, tr, br, bl])
-                n = len(poly)
-                area = 0.5 * abs(sum(
-                    poly[i][0] * poly[(i+1) % n][1] -
-                    poly[(i+1) % n][0] * poly[i][1]
-                    for i in range(n)
-                ))
-                if area < 0.05 * w_img * h_img:  # 至少占图像面积 5%
-                    return 1e6
-
-                H = corners_to_H(params, _src)
-                if H is None:
-                    return 1e6
-                return cost_sub(H)
-
+        if best_cost >= SKIP_DE_THRESHOLD:
+            # 全局搜索范围
+            def bx(r): return int(r * w_img)
+            def by(r): return int(r * h_img)
+            BOUNDS = [
+                (bx(0.18), bx(0.42)),  # tl_x
+                (by(0.28), by(0.52)),  # tl_y
+                (bx(0.55), bx(0.86)),  # tr_x
+                (by(0.28), by(0.52)),  # tr_y
+                (0,        bx(0.21)),  # bl_x
+                (by(0.69), by(0.91)),  # bl_y
+                (bx(0.78), bx(1.00)),  # br_x
+                (by(0.69), by(0.91)),  # br_y
+            ]
             result = differential_evolution(
-                de_cost, BOUNDS,
+                corners_cost, BOUNDS,
                 maxiter=600, popsize=15, tol=0.001,
                 seed=42, workers=1, polish=False,
                 mutation=(0.5, 1.5), recombination=0.7)
-
             H_de = corners_to_H(result.x)
             c_de = self._cost(H_de, dist_map)
-            print(f"[template] case{case_i} diff-evolution: {c_de:.3f}  ({result.nit} iters)")
-
+            print(f"[   court] diff-evolution: {c_de:.3f}  ({result.nit} iters)")
             if c_de < best_cost:
                 best_cost, best_H = c_de, H_de
+        else:
+            print(f"[   court] init cost {best_cost:.3f} < {SKIP_DE_THRESHOLD}, skipping DE")
 
-        # Nelder-Mead 精调
-        cost_fn = lambda h: self._cost(h.reshape(3, 3), dist_map)
-        r = minimize(cost_fn, best_H.flatten(), method='Nelder-Mead',
-                     options={'maxiter': 8000, 'xatol': 0.1,
+        if best_H is None:
+            raise RuntimeError("所有初始化方法均失败，无法检测球场")
+
+        # Nelder-Mead 精调：用 4-角参数化，防止 H 漂移到退化解
+        init_corners = cv2.perspectiveTransform(
+            SRC_M.reshape(-1, 1, 2), best_H).reshape(-1, 2).flatten()
+        r = minimize(corners_cost, init_corners, method='Nelder-Mead',
+                     options={'maxiter': 8000, 'xatol': 0.5,
                               'fatol': 0.01, 'adaptive': True})
-        c_final = cost_fn(r.x)
-        print(f"[template] Nelder-Mead refine: {best_cost:.3f} -> {c_final:.3f}  ({r.nit} iters)")
+        H_nm = corners_to_H(r.x)
+        c_nm = self._cost(H_nm, dist_map) if H_nm is not None else 1e9
+        print(f"[   court] Nelder-Mead refine: {best_cost:.3f} -> {c_nm:.3f}  ({r.nit} iters)")
 
-        return (r.x if c_final < best_cost else best_H).reshape(3, 3)
+        return (H_nm if c_nm < best_cost else best_H).reshape(3, 3)
 
-    # ── 8. Hough 直线检测四角点（仅作初始参考）────────────────────
+    # ── 8. 初始单应矩阵：YOLO seg（主）──────────────────────────────
+    def _yolo_seg_init(self, frame, dist_map):
+        """
+        用 YOLO seg 模型检测球场多边形 mask，
+        从 mask 的凸包提取 4 个角点，计算初始 H。
+        返回 (H, cost)，失败时返回 (None, 1e9)。
+        """
+        if self._seg_model is None:
+            return None, 1e9
+
+        results = self._seg_model(frame, verbose=False, conf=0.1)
+        if not results or results[0].masks is None or len(results[0].masks) == 0:
+            return None, 1e9
+
+        # 选置信度最高的检测
+        best = int(results[0].boxes.conf.argmax())
+        poly = results[0].masks.xy[best].astype(np.float32)  # (N,2) pixel coords
+
+        # 凸包 → 近似四边形
+        hull = cv2.convexHull(poly.astype(np.int32))
+        eps = 0.02 * cv2.arcLength(hull, True)
+        approx = cv2.approxPolyDP(hull, eps, True).reshape(-1, 2).astype(np.float32)
+
+        if len(approx) < 4:
+            return None, 1e9
+
+        # 若顶点 > 4 个，按面积选最优四边形
+        if len(approx) != 4:
+            approx = self._best_quad(approx)
+
+        # 排序：tl, tr, br, bl（按 y 分上下两行，各行按 x 排序）
+        corners = self._sort_quad(approx)
+
+        src = np.array([
+            [0,        0       ],
+            [COURT_W,  0       ],
+            [COURT_W,  COURT_L ],
+            [0,        COURT_L ],
+        ], dtype=np.float32)
+
+        H = cv2.getPerspectiveTransform(src, corners)
+        cost = self._cost(H, dist_map)
+        return H.astype(np.float32), cost
+
+    @staticmethod
+    def _sort_quad(pts):
+        """将 4 点排列为 tl, tr, br, bl 顺序。"""
+        pts = pts[np.argsort(pts[:, 1])]   # 按 y 排序
+        top, bot = pts[:2], pts[2:]
+        top = top[np.argsort(top[:, 0])]   # 按 x 排序
+        bot = bot[np.argsort(bot[:, 0])]
+        return np.array([top[0], top[1], bot[1], bot[0]], dtype=np.float32)
+
+    @staticmethod
+    def _best_quad(pts):
+        """从多边形顶点中选出面积最大的四边形组合。"""
+        from itertools import combinations
+        best_area, best_quad = 0, pts[:4]
+        for combo in combinations(range(len(pts)), 4):
+            q = pts[list(combo)]
+            hull = cv2.convexHull(q.astype(np.int32))
+            area = cv2.contourArea(hull)
+            if area > best_area:
+                best_area = area
+                best_quad = q
+        return best_quad
+
     def _get_hough_H(self, frame, court_mask, dist_map):
-        corners = self._detect_corners(frame, court_mask)
-        if corners is None:
-            # 无法检测角点时，返回单位矩阵（差分进化会从 BOUNDS 里自行搜索）
-            return np.eye(3, dtype=np.float32)
-        src = np.array([[0, 0], [COURT_W, 0], [0, COURT_L], [COURT_W, COURT_L]],
-                       dtype=np.float32)
-        H, _ = cv2.findHomography(src, corners, method=0)
-        return H if H is not None else np.eye(3, dtype=np.float32)
-
-    def _detect_corners(self, frame, court_mask):
-        h_img, w_img = frame.shape[:2]
-        gray   = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        _, white = cv2.threshold(gray, 160, 255, cv2.THRESH_BINARY)
-        white_in = cv2.bitwise_and(white, court_mask)
-        edges_w  = cv2.Canny(cv2.dilate(white_in, np.ones((3,3)), 1), 30, 100)
-        boundary = court_mask - cv2.erode(court_mask, np.ones((5,5),np.uint8), 4)
-        edges    = cv2.bitwise_or(edges_w, cv2.Canny(boundary, 30, 100))
-
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180,
-                                threshold=60, minLineLength=60, maxLineGap=20)
-        if lines is None:
-            return None
-
-        ys = np.where(court_mask.any(axis=1))[0]
-        if len(ys) == 0:
-            return None
-        mask_top = int(ys.min())
-
-        horiz, diag = [], []
-        for l in lines:
-            x1, y1, x2, y2 = l[0]
-            angle  = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
-            length = np.hypot(x2 - x1, y2 - y1)
-            if angle < 25:
-                horiz.append(((y1+y2)/2, length, l[0]))
-            elif angle > 40:
-                diag.append(l[0])
-
-        if len(horiz) < 2:
-            return None
-
-        horiz.sort(key=lambda x: x[0])
-        all_ys = np.array([h[0] for h in horiz])
-        split  = int(np.argmax(np.diff(all_ys))) + 1
-        top_g, bot_g = horiz[:split], horiz[split:]
-        if not top_g or not bot_g:
-            return None
-
-        _, _, top_seg = max(top_g,  key=lambda x: x[1])
-        _, _, bot_seg = max(bot_g,  key=lambda x: x[1])
-        top_y = (top_seg[1] + top_seg[3]) / 2
-        bot_y = (bot_seg[1] + bot_seg[3]) / 2
-        if bot_y - top_y < frame.shape[0] * 0.10:
-            return None
-
-        def seg_to_virtual(seg):
-            x1, y1, x2, y2 = seg
-            if abs(y2-y1) < 5: return None
-            xa = x1 + (mask_top - y1)*(x2-x1)/(y2-y1)
-            xb = x1 + (bot_y    - y1)*(x2-x1)/(y2-y1)
-            return [int(xa), int(mask_top), int(xb), int(bot_y)]
-
-        def mask_side(side):
-            xs_list = []
-            y_range = range(int(mask_top), int(bot_y), 4)
-            for y in y_range:
-                row = court_mask[y]
-                pts = np.where(row > 0)[0]
-                if len(pts) == 0: continue
-                xs_list.append(pts.min() if side=='left' else pts.max())
-            if len(xs_list) < 20: return None
-            ys_a = np.array(list(y_range)[:len(xs_list)], np.float32)
-            xs_a = np.array(xs_list, np.float32)
-            c = np.polyfit(ys_a, xs_a, 1)
-            y1_, y2_ = int(mask_top), int(bot_y)
-            return [int(np.polyval(c, y1_)), y1_, int(np.polyval(c, y2_)), y2_]
-
-        left_v  = [s for s in diag if (s[0]+s[2])/2 < w_img/2
-                   and abs(s[3]-s[1]) > (bot_y-mask_top)*0.20]
-        right_v = [s for s in diag if (s[0]+s[2])/2 > w_img/2
-                   and abs(s[3]-s[1]) > (bot_y-mask_top)*0.20]
-
-        left_line  = (seg_to_virtual(max(left_v,  key=lambda s:abs(s[3]-s[1])))
-                      if left_v  else mask_side('left'))
-        right_line = (seg_to_virtual(max(right_v, key=lambda s:abs(s[3]-s[1])))
-                      if right_v else mask_side('right'))
-
-        if left_line is None or right_line is None:
-            return None
-
-        def line_eq(seg):
-            x1,y1,x2,y2 = seg
-            a,b = y2-y1, x1-x2
-            return np.array([a, b, x2*y1-x1*y2], dtype=float)
-
-        def intersect(s1, s2):
-            e1,e2 = line_eq(s1), line_eq(s2)
-            c = np.cross(e1, e2)
-            if abs(c[2]) < 1e-6: return None
-            return np.array([c[0]/c[2], c[1]/c[2]])
-
-        tl = intersect(top_seg, left_line)
-        tr = intersect(top_seg, right_line)
-        bl = intersect(bot_seg, left_line)
-        br = intersect(bot_seg, right_line)
-        if any(p is None for p in [tl,tr,bl,br]):
-            return None
-        return np.array([tl,tr,bl,br], dtype=np.float32)
+        H_seg, c_seg = self._yolo_seg_init(frame, dist_map)
+        print(f"[   court] YOLO seg init:   cost={c_seg:.3f}")
+        return H_seg
 
     # ── 9. 投影关键点 & 可视化 ─────────────────────────────────────
     def _project_keypoints(self, H, img_shape):
@@ -607,5 +633,5 @@ class CourtDetector:
             vis[int(y), int(x)] = (0, 255, 0)
 
         cv2.imwrite(path, vis, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        print(f"[template] 调试图: {path}")
+        print(f"[   court] 调试图: {path}")
         return vis

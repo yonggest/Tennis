@@ -148,7 +148,6 @@ def main():
     # ── 单遍流式处理：读帧 → 处理 → 写帧 ─────────────────────────────────────
     _, _, _, n_frames = video_info(args.input)
     nw = len(str(n_frames)) if n_frames else 6
-    out_path = os.path.splitext(output_path)[0] + '.mp4'
     t0 = time.time()
     count = 0
 
@@ -161,12 +160,12 @@ def main():
             count = fi + 1
             if n_frames:
                 pct = count * 100 // n_frames
-                print(f"[   render] {count:>{nw}}/{n_frames} frames  ({pct:>3}%)", end='\r', flush=True)
+                print(f"[  render] {count:>{nw}}/{n_frames} frames  ({pct:>3}%)", end='\r', flush=True)
             else:
-                print(f"[   render] {count} frames", end='\r', flush=True)
+                print(f"[  render] {count} frames", end='\r', flush=True)
 
-    print(f"[   render] {count:>{nw}}/{count} frames  (100%)  done: {time.time()-t0:>6.1f}s")
-    print(f"[   render] saved → {out_path}", flush=True)
+    print(f"[  render] {count:>{nw}}/{count} frames  (100%)  done: {time.time()-t0:>6.1f}s")
+    print(f"[  render] saved → {output_path}", flush=True)
 
 
 if __name__ == '__main__':
