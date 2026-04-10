@@ -40,7 +40,31 @@ python3.10 -m venv .venv
 .venv/bin/python debug_court.py -i <video>
 ```
 
-输出：`<video>_court_debug.jpg`、`<video>_court_mask.jpg`
+输出：`<video>_debug/` 目录，包含各阶段中间结果（0_original ~ 9_step3_optimized）。
+
+---
+
+## 球场检测算法
+
+球场检测的目标是求一个 3×3 单应矩阵 H，将球场米坐标映射到图像像素坐标，进而投影出 14 个关键点。
+
+### 代价函数
+
+将球场线条模板的所有白线像素通过 H 投影到图像，取落点处 `dist_map` 值的均值作为代价。`dist_map` 是图像中实际白线像素的距离变换（每个像素 = 到最近白线的距离，上限 cap）。代价越小，说明模板投影与实际白线越重合。
+
+### 三阶段检测流程
+
+**步骤1 — YOLO seg 初始化**
+
+用 `court_seg.pt` 对第一帧做实例分割，得到球场区域多边形。对凸包做近似，提取四个角点，用 `getPerspectiveTransform` 计算初始 H。这一步给出足够准确的起点，使后续优化不会陷入错误局部极小。
+
+**步骤2 — 粗 dist_map + Nelder-Mead 精调**
+
+用颜色分割（HSV 绿色范围）得到粗粒度球场 mask，在 mask 内检测白线像素（HSV V>180, S<50），做距离变换得到 dist_map。以 dist_map 为目标函数，用 Nelder-Mead 优化 4 个角点的图像坐标（8 个参数），从步骤1的 H 出发精调。此阶段 mask 范围宽松，dist_map 可能含场地表面的假白点，但足以把 H 收敛到正确区域。
+
+**步骤3 — 精 dist_map + 再次精调**
+
+用步骤2的 H 将所有球场线条（含网线）投影回图像，以自然线宽 × 2（面积扩大一倍）绘制带状 line_mask。再次在 line_mask 内检测白线像素、重建 dist_map2，从步骤2的 H 出发再次 Nelder-Mead 精调。line_mask 仅覆盖实际线条附近，排除了大面积场地表面的假白点，代价函数对 H 的偏移更敏感，最终结果更准确。
 
 ---
 

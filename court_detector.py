@@ -139,16 +139,43 @@ class CourtDetector:
 
     # ── 2. 主入口 ──────────────────────────────────────────────────
     def predict(self, frame):
+        """
+        三阶段球场检测流程：
+
+        步骤1  YOLO seg 初始化
+               用 court_seg 模型分割球场区域，提取四边形四角，
+               getPerspectiveTransform → 粗略初始单应矩阵 H_init。
+
+        步骤2  粗 dist_map + Nelder-Mead 精调
+               用颜色分割 mask（_get_court_mask）限定白线检测范围，
+               对范围内的白线像素做距离变换得到 dist_map。
+               以 dist_map 为目标，Nelder-Mead 精调 4 个角点坐标 → H_opt。
+               此阶段 mask 范围较宽松（含场外余量），dist_map 可能含
+               场地表面的假白点，但足以把 H 拉到正确区域。
+
+        步骤3  精 dist_map + 再次精调
+               用步骤2的 H_opt 把球场线条反投影回图像，得到仅覆盖
+               实际白线附近的带状 line_mask，重建更精确的 dist_map2。
+               再次 Nelder-Mead 从 H_opt 出发做精调 → H_opt2。
+               line_mask 排除了大面积场地表面的假白点，代价函数
+               梯度更锐利，优化结果更准确。
+        """
+        # 步骤1：YOLO seg 粗略初始化
         court_mask = self._get_court_mask(frame)
         dist_map   = self._build_dist_map(frame, court_mask)
+        H_init     = self._get_hough_H(frame, court_mask, dist_map)
 
-        # YOLO seg 初始 H + 模板匹配精调
-        H_init = self._get_hough_H(frame, court_mask, dist_map)
-        H_opt  = self._optimize(H_init, dist_map, frame.shape)
+        # 步骤2：粗 dist_map 下的 Nelder-Mead 精调
+        H_opt = self._optimize(H_init, dist_map, frame.shape)
+
+        # 步骤3：用 H_opt 重建精 dist_map，再次精调
+        line_mask = self._build_line_mask(H_opt, frame.shape)
+        dist_map2 = self._build_dist_map(frame, line_mask)
+        H_opt2    = self._optimize(H_opt, dist_map2, frame.shape)
 
         self._init_H = H_init  # 供调试用：优化前的初始估计
-        self._last_H = H_opt   # 供调试用
-        kps = self._project_keypoints(H_opt, frame.shape)
+        self._last_H = H_opt2  # 供调试用
+        kps = self._project_keypoints(H_opt2, frame.shape)
         return kps.flatten()
 
     # ── 3. 球场颜色分割 ────────────────────────────────────────────
@@ -188,20 +215,59 @@ class CourtDetector:
             mask = clean
         return mask
 
+    # ── 4a. 基于优化后 H 构建球场线条 mask ─────────────────────────
+    def _build_line_mask(self, H, img_shape):
+        """
+        将所有球场线条（COURT_LINES + 网线）通过单应矩阵 H 投影到图像坐标，
+        以"自然线宽 × 2"（即面积扩大一倍）的粗细绘制，返回带状二值 mask。
+
+        为何面积 ×2：
+          - 自然线宽（lw_m × ppm）覆盖实际白线像素的理论范围
+          - 扩大一倍作为容差，吸收 H 的残余误差和透视不均匀
+          - 同时保持 mask 足够紧致，排除远离线条的场地表面（假白点来源）
+
+        px/m 估算：取远端底线（y=0）和近端底线（y=COURT_L）在图像中的
+        像素宽度各除以 COURT_W，取平均，抵消透视压缩的影响。
+        """
+        h_img, w_img = img_shape[:2]
+        mask = np.zeros((h_img, w_img), dtype=np.uint8)
+
+        # 估算平均像素/米比例：用远近两端底线宽度取平均
+        corners_m = np.array([[[0, 0], [COURT_W, 0],
+                                [0, COURT_L], [COURT_W, COURT_L]]], dtype=np.float32)
+        px = cv2.perspectiveTransform(corners_m, H)[0]
+        ppm = (np.linalg.norm(px[1] - px[0]) / COURT_W +
+               np.linalg.norm(px[3] - px[2]) / COURT_W) / 2.0
+
+        # 逐条投影线条，厚度 = 自然线宽 × 2（面积×2）
+        all_lines = list(COURT_LINES) + [([0, NET_Y], [COURT_W, NET_Y], LINE_W)]
+        for (p1, p2, lw_m) in all_lines:
+            pts = np.array([[[p1[0], p1[1]], [p2[0], p2[1]]]], dtype=np.float32)
+            proj = cv2.perspectiveTransform(pts, H)[0].astype(int)
+            thickness = max(2, round(lw_m * ppm * 2))
+            cv2.line(mask, tuple(proj[0]), tuple(proj[1]), 255, thickness)
+
+        return mask
+
     # ── 4. 构建距离场 ──────────────────────────────────────────────
     def _build_dist_map(self, frame, court_mask, cap=None):
         """
-        对实际图像中的白线像素直接求距离变换（不做 Canny）。
-        每个像素的值 = 到最近白线像素的距离（上限 cap）。
-        模板像素落在白线内部或边缘均得到低代价，更鲁棒。
+        在 court_mask 范围内检测白线像素，对非白线像素做距离变换，
+        返回每个像素到最近白线的距离（上限 cap）。
 
-        白线判定：HSV 高亮度（V > 180）+ 低饱和度（S < 50），
-        比单纯灰度阈值更精确，避免把亮色球场地面误判为白线。
+        用法：
+          - 步骤2 传入 _get_court_mask 的粗粒度 mask（整个球场区域）
+          - 步骤3 传入 _build_line_mask 的细粒度 mask（线条带状区域）
+          细粒度 mask 排除了大面积场地表面，dist_map 更干净，
+          代价函数对 H 的偏移更敏感，优化收敛到更准确的结果。
+
+        白线判定：HSV 高亮度（V > 180）+ 低饱和度（S < 50）。
+        cap 限制最大距离，防止远离线条的区域主导代价均值。
         """
         if cap is None:
             cap = frame.shape[0] * 0.046    # ~4.6% 图像高度
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        white = cv2.inRange(hsv, np.array([0, 0, 180]), np.array([180, 50, 255]))
+        white    = cv2.inRange(hsv, np.array([0, 0, 180]), np.array([180, 50, 255]))
         white_in = cv2.bitwise_and(white, court_mask)
         dist = cv2.distanceTransform(
                    cv2.bitwise_not(white_in), cv2.DIST_L2, 5)

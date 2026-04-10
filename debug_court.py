@@ -141,6 +141,32 @@ def main():
         vis_tmpl[y, x] = (0, 255, 0)
     save(f"{out_dir}/6_template_proj.jpg", vis_tmpl, "模板白线像素投影（绿点）")
 
+    # ── 步骤 7：line_mask（步骤3用的更紧致 mask）──────────────────
+    line_mask = detector._build_line_mask(H_opt, frame.shape)
+    vis_lm = frame.copy()
+    vis_lm[line_mask == 0] = (vis_lm[line_mask == 0] * 0.35).astype(np.uint8)
+    save(f"{out_dir}/7_line_mask.jpg", vis_lm, "步骤3 line_mask（场外+线条间区域变暗）")
+
+    # ── 步骤 8：dist_map2（用 line_mask 重建的距离场）─────────────
+    dist_map2 = detector._build_dist_map(frame, line_mask)
+    cap_val2   = float(dist_map2.max())
+    dist_vis2  = (dist_map2 / cap_val2 * 255).astype(np.uint8)
+    dist_color2 = cv2.applyColorMap(dist_vis2, cv2.COLORMAP_INFERNO)
+    save(f"{out_dir}/8_dist_map2.jpg", dist_color2, "步骤3 dist_map2（line_mask 重建）")
+
+    # ── 步骤 9：步骤3再次优化后结果 ──────────────────────────────
+    H_opt2 = detector._optimize(H_opt, dist_map2, frame.shape)
+    c_opt2 = detector._cost(H_opt2, dist_map2)
+    print(f"  step3 optimized cost: {c_opt2:.3f}")
+
+    vis_opt2 = draw_court_lines(frame, H_opt2, color=(0, 255, 128), thickness=1)
+    kps2 = cv2.perspectiveTransform(MODEL_KPS_M.reshape(-1,1,2), H_opt2).reshape(-1,2).astype(int)
+    for pt in kps2:
+        cv2.circle(vis_opt2, tuple(pt), 4, (0, 255, 128), -1)
+    cv2.putText(vis_opt2, f"step3 cost={c_opt2:.3f}", (20, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 128), 2)
+    save(f"{out_dir}/9_step3_optimized.jpg", vis_opt2, f"步骤3优化后 H（cost={c_opt2:.3f}）")
+
     print("\n完成。")
 
 
