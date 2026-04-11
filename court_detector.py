@@ -92,6 +92,9 @@ class CourtDetector:
             from ultralytics import YOLO
             self._seg_model = YOLO(seg_path, verbose=False)
             print(f"[   court] court seg model: {seg_path}")
+        # 帧级推理缓存（同帧只推理一次）
+        self._seg_cache_id = None   # id(frame)
+        self._seg_cache_res = None  # 上次推理结果
 
     # ── 1. 构建模板 ────────────────────────────────────────────────
     def _build_template(self, scale: int):
@@ -147,7 +150,7 @@ class CourtDetector:
                getPerspectiveTransform → 粗略初始单应矩阵 H_init。
 
         步骤2  粗 dist_map + Nelder-Mead 精调
-               用颜色分割 mask（_get_court_mask）限定白线检测范围，
+               用 YOLO seg 多边形膨胀 mask（_get_court_mask）限定白线检测范围，
                对范围内的白线像素做距离变换得到 dist_map。
                以 dist_map 为目标，Nelder-Mead 精调 4 个角点坐标 → H_opt。
                此阶段 mask 范围较宽松（含场外余量），dist_map 可能含
@@ -178,42 +181,34 @@ class CourtDetector:
         kps = self._project_keypoints(H_opt2, frame.shape)
         return kps.flatten()
 
-    # ── 3. 球场颜色分割 ────────────────────────────────────────────
+    # ── 3. 球场 mask ────────────────────────────────────────────────
+    def _run_seg(self, frame):
+        """对 frame 做 YOLO seg 推理，带帧级缓存（同帧只推理一次）。"""
+        fid = id(frame)
+        if fid != self._seg_cache_id:
+            if self._seg_model is None:
+                raise RuntimeError("court seg model not loaded")
+            self._seg_cache_res = self._seg_model(frame, verbose=False, conf=0.1)
+            self._seg_cache_id  = fid
+        return self._seg_cache_res
+
     def _get_court_mask(self, frame):
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        ks  = max(3, int(frame.shape[0] * 0.023) | 1)  # ~2.3% 图像高度
-        k   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
-
-        broad = cv2.inRange(hsv, np.array([80, 15, 60]),
-                                  np.array([135, 220, 230]))
-        broad = cv2.morphologyEx(broad, cv2.MORPH_CLOSE, k)
-        broad = cv2.morphologyEx(broad, cv2.MORPH_OPEN,  k)
-        cnts, _ = cv2.findContours(broad, cv2.RETR_EXTERNAL,
-                                    cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts:
-            return broad
-        roi = np.zeros_like(broad)
-        cv2.drawContours(roi, [max(cnts, key=cv2.contourArea)], -1, 255, -1)
-
-        pixels = hsv[roi > 0]
-        if len(pixels) < 1000:
-            return roi
-        lo, hi = [], []
-        for ch in range(3):
-            m, s = pixels[:, ch].mean(), pixels[:, ch].std()
-            lo.append(max(0,   int(m - 2.0 * s)))
-            hi.append(min(255, int(m + 2.0 * s)))
-        mask = cv2.inRange(hsv, np.array(lo), np.array(hi))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k)
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                    cv2.CHAIN_APPROX_SIMPLE)
-        if cnts:
-            clean = np.zeros_like(mask)
-            cv2.drawContours(clean, [max(cnts, key=cv2.contourArea)],
-                             -1, 255, -1)
-            mask = clean
-        return mask
+        """
+        用 YOLO seg 多边形填充 + 膨胀作为 court_mask。
+        膨胀量 ~5% 图像高度，保证边界线条完整落在 mask 内。
+        YOLO seg 必须成功；若失败则抛出异常。
+        """
+        h, w = frame.shape[:2]
+        results = self._run_seg(frame)
+        if not results or results[0].masks is None or len(results[0].masks) == 0:
+            raise RuntimeError("YOLO seg: no court detected")
+        best = int(results[0].boxes.conf.argmax())
+        poly = results[0].masks.xy[best].astype(np.int32)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask, [poly], 255)
+        ks = max(3, int(h * 0.05) | 1)
+        k  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+        return cv2.dilate(mask, k)
 
     # ── 4a. 基于优化后 H 构建球场线条 mask ─────────────────────────
     def _build_line_mask(self, H, img_shape):
@@ -432,10 +427,10 @@ class CourtDetector:
         从 mask 的凸包提取 4 个角点，计算初始 H。
         返回 (H, cost)，失败时返回 (None, 1e9)。
         """
-        if self._seg_model is None:
+        try:
+            results = self._run_seg(frame)
+        except RuntimeError:
             return None, 1e9
-
-        results = self._seg_model(frame, verbose=False, conf=0.1)
         if not results or results[0].masks is None or len(results[0].masks) == 0:
             return None, 1e9
 
