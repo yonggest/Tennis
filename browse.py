@@ -14,12 +14,14 @@ import sys
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import Qt, QPointF, QRectF, QTimer
-from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtCore import Qt, QPointF, QRectF, QSize, QThread, QTimer, Signal
+from PySide6.QtGui import (
+    QBrush, QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap, QPolygonF,
+)
 from PySide6.QtWidgets import (
-    QApplication, QFrame, QGraphicsPixmapItem, QGraphicsScene,
-    QGraphicsView, QHBoxLayout, QLabel, QMainWindow, QPushButton,
-    QSlider, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QFrame, QGraphicsScene, QGraphicsView,
+    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
+    QPushButton, QSlider, QSplitter, QVBoxLayout, QWidget,
 )
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
@@ -31,6 +33,8 @@ _PALETTE = [
     ("#aa44ff", "#4a1e6e"),
     ("#33cccc", "#1e5c5c"),
 ]
+_COURT_COLOR = "#f0c040"
+_THUMB_W     = 120   # 缩略图宽度（像素）
 
 
 # ── JSON 加载 ─────────────────────────────────────────────────────────────────
@@ -56,11 +60,44 @@ def load_annotations(json_path: Path) -> tuple[dict, dict, dict | None]:
             "score":       ann.get("score", 1.0),
         })
 
-    court = data.get("court")   # {"keypoints": [...], "valid_hull": [...]} 或 None
+    court = data.get("court")
     return frame_anns, cats, court
 
 
-# ── View（缩放/平移，与 annotate.py 保持一致） ────────────────────────────────
+# ── 后台缩略图加载线程 ────────────────────────────────────────────────────────
+
+class _ThumbLoader(QThread):
+    """顺序读取视频，逐帧发出缩略图（避免随机 seek，速度快）。"""
+    ready = Signal(int, QImage)   # (frame_idx, thumbnail)
+
+    def __init__(self, video_path: Path, total_frames: int):
+        super().__init__()
+        self._path    = video_path
+        self._total   = total_frames
+        self._stopped = False
+
+    def stop(self):
+        self._stopped = True
+
+    def run(self):
+        cap = cv2.VideoCapture(str(self._path))
+        for i in range(self._total):
+            if self._stopped:
+                break
+            ok, bgr = cap.read()
+            if not ok:
+                break
+            h, w  = bgr.shape[:2]
+            th    = max(1, _THUMB_W * h // w)
+            small = cv2.resize(bgr, (_THUMB_W, th), interpolation=cv2.INTER_AREA)
+            rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            img   = QImage(rgb.data, _THUMB_W, th,
+                           _THUMB_W * 3, QImage.Format_RGB888).copy()
+            self.ready.emit(i, img)
+        cap.release()
+
+
+# ── View（缩放/平移） ─────────────────────────────────────────────────────────
 
 class View(QGraphicsView):
     def __init__(self, scene):
@@ -72,14 +109,11 @@ class View(QGraphicsView):
         delta = event.angleDelta().y()
         if delta == 0:
             return
-        factor = 1.0 + delta / 1200.0
-        factor = max(0.5, min(factor, 2.0))
+        factor = max(0.5, min(1.0 + delta / 1200.0, 2.0))
         self.scale(factor, factor)
 
 
 # ── 主窗口 ────────────────────────────────────────────────────────────────────
-
-_COURT_COLOR = "#f0c040"   # 球场标注颜色（金黄）
 
 class BrowseApp(QMainWindow):
     def __init__(self, video_path: Path, frame_anns: dict, categories: dict, court: dict | None):
@@ -87,29 +121,27 @@ class BrowseApp(QMainWindow):
         self.video_path  = video_path
         self.frame_anns  = frame_anns
         self.categories  = categories
-        self.court       = court   # {"keypoints":[[x,y],...], "valid_hull":[[x,y],...]}
+        self.court       = court
 
         cat_ids = sorted(categories.keys())
-        self.cat_colors:  dict[int, QColor] = {
+        self.cat_colors: dict[int, QColor] = {
             cid: QColor(_PALETTE[i % len(_PALETTE)][0])
             for i, cid in enumerate(cat_ids)
         }
-        # 标签缩写：取最后一个词首字母大写（与 annotate.py 一致）
         self.cat_labels: dict[int, str] = {
             cid: (words[-1][0].upper() if (words := categories[cid].split()) else "?")
             for cid in cat_ids
         }
         self.visible_cats: set = set(cat_ids)
-        self.show_court: bool = court is not None
+        self.show_court: bool  = court is not None
 
-        # OpenCV 视频
         self.cap = cv2.VideoCapture(str(video_path))
         if not self.cap.isOpened():
             print(f"错误: 无法打开视频 {video_path}", file=sys.stderr)
             sys.exit(1)
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps          = self.cap.get(cv2.CAP_PROP_FPS) or 25.0
-        self.current_frame: int = -1   # -1 表示尚未加载
+        self.current_frame: int = -1
 
         self._current_pixmap: QPixmap | None = None
         self._img_w = self._img_h = 0
@@ -120,13 +152,19 @@ class BrowseApp(QMainWindow):
         self._play_timer.timeout.connect(self._play_next)
 
         self._build_ui()
+
+        # 后台加载缩略图
+        self._thumb_loader = _ThumbLoader(video_path, self.total_frames)
+        self._thumb_loader.ready.connect(self._on_thumb_ready)
+        self._thumb_loader.start()
+
         self._goto_frame(0)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         self.setWindowTitle(f"Browse — {self.video_path.name}")
-        self.resize(1280, 820)
+        self.resize(1440, 820)
         self.setStyleSheet("QMainWindow { background:#1e1e1e; }")
 
         # 工具栏（类别可见性切换）
@@ -168,6 +206,24 @@ class BrowseApp(QMainWindow):
         tl.addStretch()
         self.status_lbl = QLabel("", styleSheet="color:#4ec9b0; font:11pt Menlo;")
         tl.addWidget(self.status_lbl)
+
+        # 左侧缩略图列表
+        thumb_h = _THUMB_W * 9 // 16
+        self.thumb_list = QListWidget()
+        self.thumb_list.setFixedWidth(_THUMB_W + 24)
+        self.thumb_list.setIconSize(QSize(_THUMB_W, thumb_h))
+        self.thumb_list.setUniformItemSizes(True)
+        self.thumb_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.thumb_list.setStyleSheet("""
+            QListWidget { background:#141414; border:none; outline:none; }
+            QListWidget::item { color:#555; font:9pt Menlo;
+                                border-bottom:1px solid #222; padding:2px 0; }
+            QListWidget::item:selected { background:#2a4a6e; color:#ccc; }
+        """)
+        for i in range(self.total_frames):
+            item = QListWidgetItem(str(i))
+            self.thumb_list.addItem(item)
+        self.thumb_list.currentRowChanged.connect(self._on_list_select)
 
         # Scene / View
         self.scene = QGraphicsScene()
@@ -224,25 +280,42 @@ class BrowseApp(QMainWindow):
         )
 
         right = QWidget()
-        rl = QVBoxLayout(right); rl.setContentsMargins(0,0,0,0); rl.setSpacing(0)
+        rl = QVBoxLayout(right); rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(0)
         rl.addWidget(self.view, 1)
         rl.addWidget(ctrl)
         rl.addWidget(hint)
 
+        # 分割器：左=缩略图列表，右=主视图
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self.thumb_list)
+        splitter.addWidget(right)
+        splitter.setSizes([_THUMB_W + 24, 1280])
+        splitter.setHandleWidth(2)
+        splitter.setStyleSheet("QSplitter::handle { background:#333; }")
+
         central = QWidget()
-        cl = QVBoxLayout(central); cl.setContentsMargins(0,0,0,0); cl.setSpacing(0)
+        cl = QVBoxLayout(central); cl.setContentsMargins(0, 0, 0, 0); cl.setSpacing(0)
         cl.addWidget(toolbar)
-        cl.addWidget(right, 1)
+        cl.addWidget(splitter, 1)
         self.setCentralWidget(central)
+
+    # ── 缩略图 ────────────────────────────────────────────────────────────────
+
+    def _on_thumb_ready(self, idx: int, img: QImage):
+        item = self.thumb_list.item(idx)
+        if item:
+            item.setIcon(QIcon(QPixmap.fromImage(img)))
+            item.setText("")
 
     # ── 帧导航 ────────────────────────────────────────────────────────────────
 
     def _goto_frame(self, idx: int):
         idx = max(0, min(idx, self.total_frames - 1))
 
-        # 只有帧号变化时才重新读取视频
         if idx != self.current_frame:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            # 顺序前进时跳过 seek，显著提升播放速度
+            if idx != self.current_frame + 1:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ok, bgr = self.cap.read()
             if not ok:
                 return
@@ -261,8 +334,16 @@ class BrowseApp(QMainWindow):
         self.frame_lbl.setText(f"{self.current_frame} / {self.total_frames - 1}")
         self._update_status()
 
+        # 同步缩略图列表（blockSignals 防止回调 _on_list_select 形成循环）
+        self.thumb_list.blockSignals(True)
+        self.thumb_list.setCurrentRow(self.current_frame)
+        self.thumb_list.blockSignals(False)
+        self.thumb_list.scrollToItem(
+            self.thumb_list.item(self.current_frame),
+            QAbstractItemView.PositionAtCenter,
+        )
+
     def _redraw(self):
-        """清空场景，重新绘制当前帧图像 + 标注。"""
         self.scene.clear()
         if self._current_pixmap:
             self.scene.addPixmap(self._current_pixmap)
@@ -275,6 +356,10 @@ class BrowseApp(QMainWindow):
     def _on_slider(self, val: int):
         self._goto_frame(val)
 
+    def _on_list_select(self, row: int):
+        if row >= 0 and row != self.current_frame:
+            self._goto_frame(row)
+
     # ── 播放 ──────────────────────────────────────────────────────────────────
 
     def _toggle_play(self):
@@ -283,8 +368,7 @@ class BrowseApp(QMainWindow):
             self._playing = False
             self.play_btn.setText("▶")
         else:
-            interval = max(1, int(1000 / self.fps))
-            self._play_timer.start(interval)
+            self._play_timer.start(max(1, int(1000 / self.fps)))
             self._playing = True
             self.play_btn.setText("⏸")
 
@@ -301,7 +385,6 @@ class BrowseApp(QMainWindow):
         font_size = max(12, self._img_h // 80)
         font = QFont("Menlo", font_size)
 
-        # 按面积从大到小排序，小框显示在上层
         anns_sorted = sorted(
             [a for a in anns if a.get("category_id", 0) in self.visible_cats],
             key=lambda a: a["bbox"][2] * a["bbox"][3],
@@ -327,7 +410,6 @@ class BrowseApp(QMainWindow):
             txt.setPos(x, y - font_size * 1.4 if y >= font_size * 1.4 else y + h + 2)
             txt.setZValue(len(anns_sorted) + z + 1)
 
-        # 球场
         if self.show_court and self.court:
             self._render_court(font_size)
 
@@ -336,22 +418,18 @@ class BrowseApp(QMainWindow):
         pen = QPen(court_color, 2)
         pen.setCosmetic(True)
 
-        # valid_hull 轮廓多边形
         hull = self.court.get("valid_hull", [])
         if len(hull) >= 2:
             poly = QPolygonF([QPointF(p[0], p[1]) for p in hull])
-            item = self.scene.addPolygon(poly, pen, QBrush(Qt.NoBrush))
-            item.setZValue(0)
+            self.scene.addPolygon(poly, pen, QBrush(Qt.NoBrush)).setZValue(0)
 
-        # 关键点
         kp_radius = max(6, font_size * 0.4)
         for kp in self.court.get("keypoints", []):
             x, y = kp
-            item = self.scene.addEllipse(
+            self.scene.addEllipse(
                 x - kp_radius, y - kp_radius, kp_radius * 2, kp_radius * 2,
                 pen, QBrush(court_color),
-            )
-            item.setZValue(0)
+            ).setZValue(0)
 
     def _toggle_vis(self, cat_id: int):
         if cat_id in self.visible_cats:
@@ -378,7 +456,6 @@ class BrowseApp(QMainWindow):
         mod = event.modifiers()
 
         if k == Qt.Key_Space and not event.isAutoRepeat():
-            # 空格进入平移模式（与 annotate.py 一致）
             self.view.setDragMode(QGraphicsView.ScrollHandDrag)
             return
         if k == Qt.Key_P:
@@ -410,6 +487,8 @@ class BrowseApp(QMainWindow):
 
     def closeEvent(self, event):
         self._play_timer.stop()
+        self._thumb_loader.stop()
+        self._thumb_loader.wait()
         self.cap.release()
         super().closeEvent(event)
 
@@ -427,8 +506,8 @@ def main():
     )
     parser.add_argument("-v", "--video", required=True, metavar="VIDEO",
                         help="input video file")
-    parser.add_argument("-j", "--json", required=True, metavar="JSON",
-                        help="annotation JSON (COCO format or frame-indexed dict)")
+    parser.add_argument("-j", "--json",  required=True, metavar="JSON",
+                        help="annotation JSON (COCO format)")
     if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(0)
