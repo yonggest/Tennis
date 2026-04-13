@@ -41,19 +41,21 @@ for video in "${videos[@]}"; do
   parse_json="$OUTPUT_ROOT/${stem}.parse.json"
   render_mp4="$OUTPUT_ROOT/${stem}.mp4"
 
+  echo ""
   echo "── $rel"
 
   if $DRY_RUN; then
-    echo "  [1] detect  → ${detect_json}"
-    echo "  [2] parse   → ${parse_json}"
-    echo "  [3] render  → ${render_mp4}"
+    echo "  [1] .venv/bin/python detect.py -i $video -o $detect_json -m $OBJECT_MODEL -s $COURT_MODEL"
+    echo "  [2] .venv/bin/python parse.py -i $detect_json -o $parse_json"
+    echo "  [3] .venv/bin/python render.py -i $video -j $parse_json -o $render_mp4"
     continue
   fi
 
   mkdir -p "$(dirname "$detect_json")"
   ok=true
 
-  echo "  [1/3] detect"
+  echo ""
+  echo "  \$ .venv/bin/python detect.py -i $video -o $detect_json -m $OBJECT_MODEL -s $COURT_MODEL"
   if ! .venv/bin/python detect.py \
       -i "$video" -o "$detect_json" \
       -m "$OBJECT_MODEL" -s "$COURT_MODEL"; then
@@ -63,7 +65,8 @@ for video in "${videos[@]}"; do
   fi
 
   if $ok; then
-    echo "  [2/3] parse"
+    echo ""
+    echo "  \$ .venv/bin/python parse.py -i $detect_json -o $parse_json"
     if ! .venv/bin/python parse.py -i "$detect_json" -o "$parse_json"; then
       echo "  ✗ parse 失败: $rel" >&2
       failed+=("$rel (parse)")
@@ -72,7 +75,8 @@ for video in "${videos[@]}"; do
   fi
 
   if $ok; then
-    echo "  [3/3] render"
+    echo ""
+    echo "  \$ .venv/bin/python render.py -i $video -j $parse_json -o $render_mp4"
     if ! .venv/bin/python render.py \
         -i "$video" -j "$parse_json" -o "$render_mp4"; then
       echo "  ✗ render 失败: $rel" >&2
@@ -81,9 +85,11 @@ for video in "${videos[@]}"; do
     fi
   fi
 
+  echo ""
   $ok && echo "  ✓ done"
 done
 
+echo ""
 echo "════════════════════════════════════════════════════════════"
 if [[ ${#failed[@]} -gt 0 ]]; then
   echo "完成，${#failed[@]} 个失败："

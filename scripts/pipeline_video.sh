@@ -7,7 +7,7 @@
 # 脚本会在 ../datasets/tennis-video-26 下递归查找该文件名，
 # 输出镜像到 runs/in-out/tennis-video-26.out/ 下相同子目录。
 
-set -uo pipefail
+set -euo pipefail
 
 DATASET_DIR="../datasets/tennis-video-26"
 OUTPUT_ROOT="runs/in-out/tennis-video-26.out"
@@ -36,24 +36,32 @@ detect_json="$OUTPUT_ROOT/${stem}.detect.json"
 parse_json="$OUTPUT_ROOT/${stem}.parse.json"
 render_mp4="$OUTPUT_ROOT/${stem}.mp4"
 
+echo "════════════════════════════════════════════════════════════"
 echo "视频:   $video"
 echo "detect: $detect_json"
 echo "parse:  $parse_json"
 echo "render: $render_mp4"
-echo "────────────────────────────────────────────────────────────"
+echo "════════════════════════════════════════════════════════════"
 
 mkdir -p "$(dirname "$detect_json")"
 
+echo ""
 echo "[1/3] detect"
+echo "\$ .venv/bin/python detect.py -i $video -o $detect_json -m $OBJECT_MODEL -s $COURT_MODEL"
 .venv/bin/python detect.py \
   -i "$video" -o "$detect_json" \
   -m "$OBJECT_MODEL" -s "$COURT_MODEL"
 
+echo ""
 echo "[2/3] parse"
+echo "\$ .venv/bin/python parse.py -i $detect_json -o $parse_json"
 .venv/bin/python parse.py -i "$detect_json" -o "$parse_json"
 
+echo ""
 echo "[3/3] render"
+echo "\$ .venv/bin/python render.py -i $video -j $parse_json -o $render_mp4"
 .venv/bin/python render.py -i "$video" -j "$parse_json" -o "$render_mp4"
 
-echo "────────────────────────────────────────────────────────────"
+echo ""
+echo "════════════════════════════════════════════════════════════"
 echo "完成: $render_mp4"
