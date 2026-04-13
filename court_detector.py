@@ -43,6 +43,10 @@ LINE_W        = 0.05   # 其余所有线：5 cm（取上限）
 CENTER_MARK_W = 0.05   # 中心标志宽 5 cm
 CENTER_MARK_L = 0.10   # 中心标志长 10 cm（向场内延伸）
 
+# ── ITF 标准场地缓冲区（比赛场地最小净空）────────────────────────
+CLEARANCE_BACK = 6.40  # 底线后方缓冲（米）
+CLEARANCE_SIDE = 3.66  # 侧线外侧缓冲（米）
+
 # ── 球场线段定义：(端点1, 端点2, 线宽_m) ─────────────────────
 # 注：坐标为线条中心线坐标（各线已向场内偏移半个线宽，使外缘对齐尺寸）
 _BH = BASELINE_W / 2   # 底线半宽
@@ -75,6 +79,13 @@ class CourtDetector:
         kps  = detector.predict(frame)            # shape (28,) — 14 关键点
         hull = detector.get_valid_zone_hull(...)   # 球场有效区域凸包
     """
+
+    @classmethod
+    def from_H(cls, H):
+        """从已知单应矩阵创建轻量实例（不加载模型），用于投影计算。"""
+        obj = object.__new__(cls)
+        obj._last_H = H
+        return obj
 
     def __init__(self, scale: int = 40, seg_model: str = None):
         """
@@ -473,13 +484,10 @@ class CourtDetector:
         pts = MODEL_KPS_M.reshape(-1, 1, 2)
         return cv2.perspectiveTransform(pts, H).reshape(-1, 2)
 
-    def get_valid_zone_hull(self, image_shape, expand=1.5, height=7.0):
+    def _recover_camera(self, image_shape):
         """
-        将 3D 三棱柱（帐篷形）投影到图像，返回凸包多边形（用于有效区域过滤）。
-        三棱柱定义：
-          底面 = 双打球场四角向外扩展 expand 米（z=0）
-          脊线 = 底线中点（网位置）左右两端，高度 height 米
-        返回 numpy int32 数组，形状 (N,1,2)，可直接传给 cv2.pointPolygonTest。
+        从单应矩阵 H 恢复相机内参 K 和外参 R, t。
+        返回 (K, P)，P = K @ [R|t] 为 3×4 投影矩阵，可将世界坐标 (x,y,z,1) 投影到图像。
         """
         from scipy.optimize import minimize_scalar
 
@@ -493,7 +501,7 @@ class CourtDetector:
             r1 = Ki @ h1;  r2 = Ki @ h2
             return (r1 @ r2) ** 2 + (r1 @ r1 - r2 @ r2) ** 2
 
-        f = minimize_scalar(cost, bounds=(w_img * 0.3, w_img * 20), method='bounded').x
+        f  = minimize_scalar(cost, bounds=(w_img * 0.3, w_img * 20), method='bounded').x
         K  = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1.0]])
         Ki = np.linalg.inv(K)
 
@@ -508,28 +516,80 @@ class CourtDetector:
         R = np.column_stack([r1, r2, r3])
 
         # 确保 z 向上（高处 v 更小）
-        def v_of(p):
-            cam = R @ p + t
-            return K[1, 1] * cam[1] / cam[2] + K[1, 2]
         mid = np.array([COURT_W / 2, COURT_L / 2, 0.0])
-        if v_of(mid + [0, 0, 1]) > v_of(mid):
+        cam_mid   = R @ mid + t
+        cam_above = R @ (mid + [0, 0, 1]) + t
+        if (K[1, 1] * cam_above[1] / cam_above[2] + K[1, 2] >
+                K[1, 1] * cam_mid[1] / cam_mid[2] + K[1, 2]):
             r3 = -r3
             R  = np.column_stack([r1, r2, r3])
 
-        # 三棱柱 6 个顶点
-        x0, x1 = -expand,       COURT_W + expand
-        y0, y1 = -expand,       COURT_L + expand
-        ym     = COURT_L / 2
+        P = K @ np.hstack([R, t[:, None]])
+        return K, P
+
+    def _project_3d(self, pts3d, P):
+        """将 (N,3) 世界坐标通过投影矩阵 P 投影为 (N,2) 图像坐标。"""
+        ph  = np.hstack([pts3d, np.ones((len(pts3d), 1))])
+        uv  = (P @ ph.T).T
+        return (uv[:, :2] / uv[:, 2:]).astype(np.float32)
+
+    def get_valid_zone_hull(self, image_shape, expand=1.5, height=7.0):
+        """
+        将 3D 三棱柱（帐篷形）投影到图像，返回凸包多边形（用于有效区域过滤）。
+        三棱柱定义：
+          底面 = 双打球场四角向外扩展 expand 米（z=0）
+          脊线 = 底线中点（网位置）左右两端，高度 height 米
+        返回 numpy int32 数组，形状 (N,1,2)，可直接传给 cv2.pointPolygonTest。
+        """
+        _, P = self._recover_camera(image_shape)
+
+        x0, x1 = -expand, COURT_W + expand
+        y0, y1 = -expand, COURT_L + expand
+        ym = COURT_L / 2
         pts3d = np.array([
             [x0, y0, 0], [x1, y0, 0], [x1, y1, 0], [x0, y1, 0],
             [x0, ym, height], [x1, ym, height],
         ])
 
-        P  = K @ np.hstack([R, t[:, None]])
-        ph = np.hstack([pts3d, np.ones((6, 1))])
-        uv = (P @ ph.T).T
-        pts2d = (uv[:, :2] / uv[:, 2:]).astype(np.float32)
-
-        hull = cv2.convexHull(pts2d.reshape(-1, 1, 2))
+        pts2d = self._project_3d(pts3d, P)
+        hull  = cv2.convexHull(pts2d.reshape(-1, 1, 2))
         return hull.astype(np.int32)
+
+    def get_clearance_volume_hull(self, image_shape, back, side, height=2.0):
+        """
+        将缓冲区立方体（8 个顶点）投影到图像，返回凸包多边形和各顶点像素坐标。
+        底面 = 缓冲区矩形（z=0），顶面 = 同一矩形上移 height 米（z=height）。
+        返回 (hull, pts2d_bottom, pts2d_top)：
+          hull          : (N,1,2) int32，可用于 pointPolygonTest / fillPoly
+          pts2d_bottom  : (4,2) float32，底面四角像素坐标（顺序 tl,tr,br,bl）
+          pts2d_top     : (4,2) float32，顶面四角像素坐标
+        必须在 predict() 之后调用。
+        """
+        _, P = self._recover_camera(image_shape)
+
+        x0, x1 = -side, COURT_W + side
+        y0, y1 = -back, COURT_L + back
+        bottom = np.array([[x0,y0,0],[x1,y0,0],[x1,y1,0],[x0,y1,0]], dtype=np.float32)
+        top    = np.array([[x0,y0,height],[x1,y0,height],[x1,y1,height],[x0,y1,height]], dtype=np.float32)
+
+        pts2d_bottom = self._project_3d(bottom, P)
+        pts2d_top    = self._project_3d(top,    P)
+        all_pts      = np.vstack([pts2d_bottom, pts2d_top])
+        hull         = cv2.convexHull(all_pts.reshape(-1, 1, 2))
+        return hull.astype(np.int32), pts2d_bottom, pts2d_top
+
+    def get_clearance_hull(self):
+        """
+        将 ITF 标准缓冲区矩形（底线后 CLEARANCE_BACK 米、侧线外 CLEARANCE_SIDE 米）
+        通过单应矩阵 H 投影到图像，返回四边形顶点 (4,1,2) int32。
+        必须在 predict() 之后调用。
+        """
+        pts_m = np.array([
+            [-CLEARANCE_SIDE,          -CLEARANCE_BACK          ],
+            [COURT_W + CLEARANCE_SIDE, -CLEARANCE_BACK          ],
+            [COURT_W + CLEARANCE_SIDE,  COURT_L + CLEARANCE_BACK],
+            [-CLEARANCE_SIDE,           COURT_L + CLEARANCE_BACK],
+        ], dtype=np.float32)
+        pts_px = cv2.perspectiveTransform(pts_m.reshape(-1, 1, 2), self._last_H)
+        return pts_px.reshape(-1, 1, 2).astype(np.int32)
 

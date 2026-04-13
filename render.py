@@ -21,7 +21,8 @@ import numpy as np
 
 from utils import video_info, iter_frames, open_video_writer, load_detections, text_params
 from ball_tracker import BallTracker
-from court_detector import MODEL_KPS_M, COURT_LINES, COURT_W as _COURT_W, NET_Y as _NET_Y
+from court_detector import (MODEL_KPS_M, COURT_LINES, COURT_W as _COURT_W, NET_Y as _NET_Y,
+                             CourtDetector, CLEARANCE_BACK, CLEARANCE_SIDE)
 
 
 # 每条球轨迹按 track_id 循环取色（BGR）
@@ -93,6 +94,39 @@ def _draw_court_kps(frame, court_kps, H):
     kps = court_kps.reshape(14, 2).astype(int)
     for pt in kps:
         cv2.circle(frame, tuple(pt), 4, color, -1)
+
+
+def _in_hull(hull, x, y):
+    return cv2.pointPolygonTest(hull, (float(x), float(y)), False) >= 0
+
+
+def _bbox_overlaps_hull(hull, x1, y1, x2, y2):
+    """bbox 与凸包多边形有重叠则返回 True（检查五个特征点）。"""
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    for pt in [(cx, cy), (x1, y1), (x2, y1), (x1, y2), (x2, y2)]:
+        if _in_hull(hull, *pt):
+            return True
+    return False
+
+
+def _filter_players(players, ground_hull):
+    """保留底部中心落在地面缓冲区内的球员。"""
+    result = []
+    for frame in players:
+        result.append([d for d in frame
+                        if _in_hull(ground_hull,
+                                    (d['bbox'][0] + d['bbox'][2]) / 2,
+                                    d['bbox'][3])])
+    return result
+
+
+def _filter_rackets(rackets, volume_hull):
+    """保留 bbox 与缓冲区立方体凸包有重叠的球拍。"""
+    result = []
+    for frame in rackets:
+        result.append([d for d in frame
+                        if _bbox_overlaps_hull(volume_hull, *d['bbox'])])
+    return result
 
 
 def _build_traj(balls):
@@ -186,6 +220,19 @@ def main():
     balls     = BallTracker.from_video(fps, _px_per_meter(court_kps)).run(balls)
     H         = _compute_H_from_kps(court_kps)
     hull_mask = _build_hull_mask(valid_hull, height, width)
+
+    # ── 缓冲区过滤：球员（地面范围）+ 球拍（2m 立方体范围）──────────────────
+    court_det   = CourtDetector.from_H(H)
+    ground_hull = court_det.get_clearance_hull()
+    vol_hull, _, _ = court_det.get_clearance_volume_hull(
+        (height, width), back=CLEARANCE_BACK, side=CLEARANCE_SIDE, height=2.0)
+    n_players_before = sum(len(f) for f in players)
+    n_rackets_before = sum(len(f) for f in rackets)
+    players = _filter_players(players, ground_hull)
+    rackets = _filter_rackets(rackets, vol_hull)
+    print(f"[  filter] players: {n_players_before} → {sum(len(f) for f in players)}")
+    print(f"[  filter] rackets: {n_rackets_before} → {sum(len(f) for f in rackets)}")
+
     traj      = _build_traj(balls)
 
     scale, thick             = text_params(height)

@@ -1,7 +1,5 @@
 import time
 
-import cv2
-import numpy as np
 import torch
 from ultralytics import YOLO
 
@@ -27,43 +25,22 @@ class ObjectsDetector:
             return 'cuda'
         return 'cpu'
 
-    def run(self, frames, valid_hull=None, frame_shape=None, total=None):
+    def run(self, frames, total=None):
         """
-        frames       : list 或任意可迭代对象（生成器）
-        frame_shape  : (height, width)，frames 为生成器时必须提供
-        total        : 总帧数，用于进度显示；frames 为生成器时必须提供
+        frames : list 或任意可迭代对象（生成器）
+        total  : 总帧数，用于进度显示
         """
-        if isinstance(frames, list):
-            fh, fw = frames[0].shape[:2]
-            total  = total or len(frames)
-        else:
-            fh, fw = frame_shape
-            total  = total or 0  # 未知时进度显示为帧计数
-
-        if valid_hull is not None:
-            bx, by, bw, bh = cv2.boundingRect(valid_hull)
-            cx1 = max(0, bx)
-            cy1 = max(0, by)
-            cx2 = min(fw, bx + bw)
-            cy2 = min(fh, by + bh)
-            mask = np.zeros((fh, fw), dtype=np.uint8)
-            cv2.fillPoly(mask, [valid_hull], 255)
-        else:
-            cx1 = cy1 = 0
-            cx2, cy2 = fw, fh
-            mask = None
+        total = total or (len(frames) if isinstance(frames, list) else 0)
 
         player_detections, racket_detections, ball_detections = [], [], []
         nw = len(str(total)) if total else 6
         t0 = time.time()
 
         for i, frame in enumerate(frames):
-            crop = cv2.bitwise_and(frame, frame, mask=mask)[cy1:cy2, cx1:cx2] \
-                   if mask is not None else frame[cy1:cy2, cx1:cx2]
-            results = self.model.predict(crop, conf=self.conf, imgsz=self.imgsz,
+            results = self.model.predict(frame, conf=self.conf, imgsz=self.imgsz,
                                          classes=self.class_ids, device=self.device,
                                          verbose=False, save=False)[0]
-            p, r, b = self._parse(results, offset=(cx1, cy1))
+            p, r, b = self._parse(results)
             player_detections.append(p)
             racket_detections.append(r)
             ball_detections.append(b)
@@ -77,15 +54,14 @@ class ObjectsDetector:
         print(f"[  detect] {n} frames  (100%)  done: {time.time()-t0:>6.1f}s")
         return player_detections, racket_detections, ball_detections
 
-    def _parse(self, results, offset=(0, 0)):
-        ox, oy = offset
+    def _parse(self, results):
         names = results.names
         players, rackets, balls = [], [], []
         for box in results.boxes:
             cls_name = names[int(box.cls[0])]
             x1, y1, x2, y2 = box.xyxy.tolist()[0]
             track_id = int(box.id[0]) if box.id is not None else None
-            det = {'bbox': [x1+ox, y1+oy, x2+ox, y2+oy], 'conf': float(box.conf[0]), 'track_id': track_id}
+            det = {'bbox': [x1, y1, x2, y2], 'conf': float(box.conf[0]), 'track_id': track_id}
             if cls_name == "person":
                 players.append(det)
             elif cls_name == "tennis racket":

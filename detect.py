@@ -58,19 +58,16 @@ def main():
 
     court = CourtDetector(seg_model=args.court_model)
     kps   = court.predict(first_frame)
-    hull  = court.get_valid_zone_hull(first_frame.shape, height=6.0)
 
-    # ── 物体检测（全部帧）───────────────────────────────────────────────────
+    # ── 物体检测（全部帧，全图推理）──────────────────────────────────────────
     objects = ObjectsDetector(args.object_model, conf=args.conf, imgsz=args.imgsz, device=args.device)
     players, rackets, balls = objects.run(
         iter_frames(args.input),
-        valid_hull=hull,
-        frame_shape=(height, width),
         total=n_frames,
     )
 
     save_coco(width, height, players, rackets, balls, output_path,
-              fps=fps, court_kps=kps, valid_hull=hull)
+              fps=fps, court_kps=kps)
 
 
 if __name__ == '__main__':

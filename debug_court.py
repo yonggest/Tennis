@@ -14,7 +14,9 @@ import sys
 import cv2
 import numpy as np
 
-from court_detector import CourtDetector, MODEL_KPS_M, COURT_LINES, COURT_W, COURT_L, NET_Y
+from court_detector import (CourtDetector, MODEL_KPS_M, COURT_LINES,
+                             COURT_W, COURT_L, NET_Y,
+                             CLEARANCE_BACK, CLEARANCE_SIDE)
 
 
 def parse_args():
@@ -25,6 +27,15 @@ def parse_args():
         p.print_help()
         sys.exit(0)
     return p.parse_args()
+
+
+def draw_volume_wireframe(vis, pts_bot, pts_top, color):
+    """绘制立方体线框：底面 + 顶面 + 四条竖边。"""
+    n = len(pts_bot)
+    for i in range(n):
+        cv2.line(vis, tuple(pts_bot[i].astype(int)), tuple(pts_bot[(i+1)%n].astype(int)), color, 1)
+        cv2.line(vis, tuple(pts_top[i].astype(int)), tuple(pts_top[(i+1)%n].astype(int)), color, 1)
+        cv2.line(vis, tuple(pts_bot[i].astype(int)), tuple(pts_top[i].astype(int)),        color, 1)
 
 
 def save(path, img, label):
@@ -166,6 +177,79 @@ def main():
     cv2.putText(vis_opt2, f"step3 cost={c_opt2:.3f}", (20, 50),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 128), 2)
     save(f"{out_dir}/9_step3_optimized.jpg", vis_opt2, f"步骤3优化后 H（cost={c_opt2:.3f}）")
+
+    # ── 步骤 10：ITF 标准缓冲区可视化 ────────────────────────────
+    # 缓冲区：底线后 CLEARANCE_BACK m，侧线外 CLEARANCE_SIDE m
+    buf_m = np.array([
+        [-CLEARANCE_SIDE,          -CLEARANCE_BACK          ],
+        [COURT_W + CLEARANCE_SIDE, -CLEARANCE_BACK          ],
+        [COURT_W + CLEARANCE_SIDE,  COURT_L + CLEARANCE_BACK],
+        [-CLEARANCE_SIDE,           COURT_L + CLEARANCE_BACK],
+    ], dtype=np.float32)
+    buf_px = cv2.perspectiveTransform(buf_m.reshape(-1, 1, 2), H_opt2).reshape(-1, 1, 2).astype(np.int32)
+
+    vis_buf = draw_court_lines(frame, H_opt2, color=(0, 255, 128), thickness=1)
+    # 缓冲区外变暗
+    buf_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(buf_mask, [buf_px], 255)
+    vis_buf[buf_mask == 0] = (vis_buf[buf_mask == 0] * 0.35).astype(np.uint8)
+    # 缓冲区边界（黄色）
+    cv2.polylines(vis_buf, [buf_px], True, (0, 220, 255), 2)
+    cv2.putText(vis_buf, f"clearance: back={CLEARANCE_BACK}m  side={CLEARANCE_SIDE}m",
+                (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 220, 255), 2)
+    save(f"{out_dir}/10_clearance_zone.jpg", vis_buf,
+         f"ITF 缓冲区（后侧{CLEARANCE_BACK}m，边线{CLEARANCE_SIDE}m）")
+
+    # ── 步骤 11：私人/俱乐部场地缩减缓冲区可视化 ─────────────────
+    cb_back, cb_side = 5.5, 3.0
+    buf2_m = np.array([
+        [-cb_side,          -cb_back          ],
+        [COURT_W + cb_side, -cb_back          ],
+        [COURT_W + cb_side,  COURT_L + cb_back],
+        [-cb_side,           COURT_L + cb_back],
+    ], dtype=np.float32)
+    buf2_px = cv2.perspectiveTransform(buf2_m.reshape(-1, 1, 2), H_opt2).reshape(-1, 1, 2).astype(np.int32)
+
+    vis_buf2 = draw_court_lines(frame, H_opt2, color=(0, 255, 128), thickness=1)
+    buf2_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(buf2_mask, [buf2_px], 255)
+    vis_buf2[buf2_mask == 0] = (vis_buf2[buf2_mask == 0] * 0.35).astype(np.uint8)
+    cv2.polylines(vis_buf2, [buf2_px], True, (0, 180, 255), 2)
+    cv2.putText(vis_buf2, f"clearance: back={cb_back}m  side={cb_side}m",
+                (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 180, 255), 2)
+    save(f"{out_dir}/11_clearance_zone_small.jpg", vis_buf2,
+         f"缩减缓冲区（后侧{cb_back}m，边线{cb_side}m）")
+
+    # ── 步骤 12：缓冲区立方体凸包（两种尺寸对比）────────────────────
+    def draw_clearance_volume(frame, H_opt2, back, side, color, label):
+        detector._last_H = H_opt2
+        hull, pts_bot, pts_top = detector.get_clearance_volume_hull(
+            frame.shape, back=back, side=side, height=2.0)
+        vis = draw_court_lines(frame, H_opt2, color=(0, 255, 128), thickness=1)
+        # 凸包外变暗
+        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(mask, [hull], 255)
+        vis[mask == 0] = (vis[mask == 0] * 0.35).astype(np.uint8)
+        # 凸包轮廓
+        cv2.polylines(vis, [hull], True, color, 2)
+        # 立方体线框
+        draw_volume_wireframe(vis, pts_bot, pts_top, color)
+        cv2.putText(vis, label, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 2)
+        return vis
+
+    vis_v1 = draw_clearance_volume(
+        frame, H_opt2,
+        back=CLEARANCE_BACK, side=CLEARANCE_SIDE,
+        color=(0, 220, 255),
+        label=f"ITF 标准: back={CLEARANCE_BACK}m side={CLEARANCE_SIDE}m h=2m")
+    save(f"{out_dir}/12a_volume_itf.jpg", vis_v1, "ITF 缓冲区立方体凸包")
+
+    vis_v2 = draw_clearance_volume(
+        frame, H_opt2,
+        back=5.5, side=3.0,
+        color=(0, 140, 255),
+        label="俱乐部: back=5.5m side=3.0m h=2m")
+    save(f"{out_dir}/12b_volume_small.jpg", vis_v2, "俱乐部缓冲区立方体凸包")
 
     print("\n完成。")
 
