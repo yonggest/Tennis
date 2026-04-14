@@ -3,7 +3,7 @@
 
 用法:
     python train_detect.py --data <data.yaml>
-    python train_detect.py --data <data.yaml> --epochs 50 --batch 4 --device 0
+    python train_detect.py --data <data.yaml> --epochs 50 --device 0
 """
 
 import sys
@@ -67,7 +67,7 @@ def main():
         batch=2,
         lr0=args.lr0,
         imgsz=1920,
-        freeze=10         ,  # 冻结 backbone 前 N 层，只微调 head
+        freeze=10,           # 冻结 backbone 前 N 层，只微调 head
         lrf=0.1,             # 最终学习率 = lr0 * lrf
         warmup_epochs=1,     # freeze > 0 只训练 head 时，建议改为 1
         patience=20,         # Early stopping

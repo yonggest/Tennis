@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # 对单个视频运行完整三阶段流水线：detect.py → parse.py → render.py
 #
-# 用法:  bash scripts/pipeline_video.sh <视频文件名>
+# 用法:  bash scripts/pipeline_video.sh [物体模型] <视频文件名>
 # 示例:  bash scripts/pipeline_video.sh 20260328_CB_M01_S01_G01_R01.mp4
+#        bash scripts/pipeline_video.sh models/yolo26x.pt 20260328_CB_M01_S01_G01_R01.mp4
 #
 # 脚本会在 ../datasets/tennis-video-26 下递归查找该文件名，
 # 输出镜像到 runs/in-out/tennis-video-26.out/ 下相同子目录。
@@ -11,18 +12,24 @@ set -euo pipefail
 
 DATASET_DIR="../datasets/tennis-video-26"
 OUTPUT_ROOT="runs/in-out/tennis-video-26.out"
-OBJECT_MODEL="models/yolo26x-finetuned.pt"
 COURT_MODEL="models/yolov8n-seg-finetuned.pt"
 
 if [[ $# -eq 0 ]]; then
-  echo "用法: bash scripts/pipeline_video.sh <视频文件名>" >&2
+  echo "用法: bash scripts/pipeline_video.sh [物体模型] <视频文件名>" >&2
   echo "示例: bash scripts/pipeline_video.sh 20260328_CB_M01_S01_G01_R01.mp4" >&2
+  echo "      bash scripts/pipeline_video.sh models/yolo26x.pt 20260328_CB_M01_S01_G01_R01.mp4" >&2
   exit 1
 fi
 
 cd "$(dirname "$0")/.."
 
-target_name="$1"
+if [[ $# -eq 2 ]]; then
+  OBJECT_MODEL="$1"
+  target_name="$2"
+else
+  OBJECT_MODEL="models/yolo26x-finetuned.pt"
+  target_name="$1"
+fi
 video="$(find "$DATASET_DIR" -name "$target_name" | head -1)"
 
 if [[ -z "$video" ]]; then
