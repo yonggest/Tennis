@@ -31,8 +31,8 @@ def parse_args():
     )
     p.add_argument("--model",  default=str(Path(__file__).parent / "models/yolo26x.pt"), help="模型权重路径")
     p.add_argument("--data",   required=True,               help="数据集配置文件（data.yaml）")
-    p.add_argument("--imgsz",  type=int,   default=640,     help="推理图片尺寸")
-    p.add_argument("--conf",   type=float, default=0.25,    help="置信度阈值")
+    p.add_argument("--imgsz",  type=int,   default=1920,     help="推理图片尺寸")
+    p.add_argument("--conf",   type=float, default=0.5,    help="置信度阈值")
     p.add_argument("--device", default="",                  help="'mps'/'cpu'/'0'(CUDA)，留空自动选择")
     p.add_argument("--limit",  type=int,   default=0,       help="最多评测多少张图片（0 = 全部）")
     if len(sys.argv) == 1:
