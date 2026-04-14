@@ -31,8 +31,7 @@ CMD=".venv/bin/python train_yolo.py \
   --batch  $BATCH \
   --imgsz  $IMGSZ \
   --lr0    $LR0 \
-  --freeze $FREEZE \
-  --name   $NAME"
+  --freeze $FREEZE"
 
 echo "════════════════════════════════════════════════════════════"
 echo "\$ $CMD"
