@@ -94,8 +94,8 @@ def _deserialize_court(raw):
     """将 JSON 中的 court dict 恢复为 numpy 数组。"""
     return {
         'keypoints':      np.array(raw.get('keypoints',      [[0,0]]*14), dtype=np.float32).flatten(),
-        'ground_hull':    np.array(raw.get('ground_hull',    [[0,0]]*4),  dtype=np.int32).reshape(-1, 1, 2),
-        'volume_hull':    np.array(raw.get('volume_hull',    [[0,0]]),    dtype=np.int32).reshape(-1, 1, 2),
+        'ground_hull':    np.array(raw.get('ground_hull',    [[0,0]]*4),  dtype=np.float32).reshape(-1, 1, 2),
+        'volume_hull':    np.array(raw.get('volume_hull',    [[0,0]]),    dtype=np.float32).reshape(-1, 1, 2),
         'vol_bottom_pts': np.array(raw.get('vol_bottom_pts', [[0,0]]*4), dtype=np.float32),
         'vol_top_pts':    np.array(raw.get('vol_top_pts',    [[0,0]]*4), dtype=np.float32),
     }

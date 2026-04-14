@@ -10,7 +10,6 @@ import argparse
 import sys
 from pathlib import Path
 
-import numpy as np
 from ultralytics import YOLO
 
 
@@ -29,36 +28,20 @@ def parse_args():
 
 def _print_class_metrics(validator):
     try:
-        v  = validator
-        m  = v.metrics
+        m    = validator.metrics
+        nt   = m.nt_per_class          # shape (nc,), GT instances per class
+        seen = validator.seen
         if len(m.ap_class_index) == 0:
             return
-        names = v.names
-        seen  = v.seen
-        nt    = getattr(v, "nt_per_class", None)
-        if nt is None:
-            nt = getattr(v, "nt", None)
-        if nt is None:
-            try:
-                lbls    = v.dataloader.dataset.labels
-                all_cls = np.concatenate([l[:, 0] for l in lbls if len(l)]).astype(int)
-                nt      = np.bincount(all_cls, minlength=max(names.keys()) + 1)
-            except Exception:
-                pass
 
-        hf  = "%22s%11s%11s%11s%11s%11s%11s"
-        pf  = "%22s%11i%11i%11.3g%11.3g%11.3g%11.3g"
-        rf  = "%22s%11i%11s%11.3g%11.3g%11.3g%11.3g"
-        fmt = pf if nt is not None else rf
-
+        hf = "%22s%11s%11s%11s%11s%11s%11s"
+        pf = "%22s%11i%11i%11.3g%11.3g%11.3g%11.3g"
         print(hf % ("Class", "Images", "Instances", "P", "R", "mAP50", "mAP50-95"))
-        n_all = int(nt.sum()) if nt is not None else "-"
-        print(fmt % ("all", seen, n_all, m.box.mp, m.box.mr, m.box.map50, m.box.map))
-        for i, cls_idx in enumerate(m.ap_class_index):
-            name   = names.get(int(cls_idx), str(cls_idx))
-            n_inst = int(nt[int(cls_idx)]) if nt is not None else "-"
-            print(fmt % (name, seen, n_inst,
-                         m.box.p[i], m.box.r[i], m.box.ap50[i], m.box.ap[i]))
+        print(pf % ("all", seen, int(nt.sum()), m.box.mp, m.box.mr, m.box.map50, m.box.map))
+        for i, c in enumerate(m.ap_class_index):
+            name = m.names.get(int(c), str(c))
+            print(pf % (name, seen, int(nt[int(c)]),
+                        m.box.p[i], m.box.r[i], m.box.ap50[i], m.box.ap[i]))
     except Exception as e:
         print(f"  [per-class metrics] 打印失败: {e}")
 
@@ -80,7 +63,7 @@ def main():
     _captured = []
     def _capture(v): _captured.append(v)
     model.add_callback("on_val_end", _capture)
-    model.val(data=args.data, imgsz=1920, device=args.device or None, verbose=False)
+    model.val(data=args.data, imgsz=1920, batch=1, plots=False, device=args.device or None, verbose=False)
 
     print()
     if _captured:

@@ -560,14 +560,14 @@ class CourtDetector:
 
         pts2d = self._project_3d(pts3d, P)
         hull  = cv2.convexHull(pts2d.reshape(-1, 1, 2))
-        return hull.astype(np.int32)
+        return hull.astype(np.float32)
 
     def get_clearance_volume_hull(self, image_shape, back, side, height=2.0):
         """
         将缓冲区立方体（8 个顶点）投影到图像，返回凸包多边形和各顶点像素坐标。
         底面 = 缓冲区矩形（z=0），顶面 = 同一矩形上移 height 米（z=height）。
         返回 (hull, pts2d_bottom, pts2d_top)：
-          hull          : (N,1,2) int32，可用于 pointPolygonTest / fillPoly
+          hull          : (N,1,2) float32，可用于 pointPolygonTest / fillPoly
           pts2d_bottom  : (4,2) float32，底面四角像素坐标（顺序 tl,tr,br,bl）
           pts2d_top     : (4,2) float32，顶面四角像素坐标
         必须在 predict() 之后调用。
@@ -583,11 +583,11 @@ class CourtDetector:
         pts2d_top    = self._project_3d(top,    P)
         all_pts      = np.vstack([pts2d_bottom, pts2d_top])
         hull         = cv2.convexHull(all_pts.reshape(-1, 1, 2))
-        return hull.astype(np.int32), pts2d_bottom, pts2d_top
+        return hull.astype(np.float32), pts2d_bottom, pts2d_top
 
     def get_clearance_hull(self, back=CLEARANCE_BACK, side=CLEARANCE_SIDE):
         """
-        将缓冲区矩形通过单应矩阵 H 投影到图像，返回四边形顶点 (4,1,2) int32。
+        将缓冲区矩形通过单应矩阵 H 投影到图像，返回四边形顶点 (4,1,2) float32。
         back : 底线后方缓冲（米），默认 ITF 标准
         side : 侧线外侧缓冲（米），默认 ITF 标准
         """
@@ -598,5 +598,5 @@ class CourtDetector:
             [-side,           COURT_L + back],
         ], dtype=np.float32)
         pts_px = cv2.perspectiveTransform(pts_m.reshape(-1, 1, 2), self._last_H)
-        return pts_px.reshape(-1, 1, 2).astype(np.int32)
+        return pts_px.reshape(-1, 1, 2).astype(np.float32)
 
