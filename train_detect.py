@@ -20,7 +20,7 @@ def parse_args():
     p.add_argument("--model",   default=str(Path(__file__).parent / "models/yolo26x.pt"), help="预训练权重路径")
     p.add_argument("--data",    required=True,               help="数据集配置文件（如 datasets/xxx-yolo/data.yaml）")
     p.add_argument("--lr0",     type=float, default=0.001,   help="初始学习率（微调时比默认小）")
-    p.add_argument("--epochs",  type=int,   default=100,     help="训练轮数")
+    p.add_argument("--epochs",  type=int,   default=50,     help="训练轮数")
     p.add_argument("--device",  default="",                  help="'mps'/'cpu'/'0'(CUDA)，留空自动选择")
     if len(sys.argv) == 1:
         p.print_help()
@@ -39,7 +39,7 @@ def main():
     print(f"  batch          2")
     print(f"  imgsz          1920")
     print(f"  lr0            {args.lr0}")
-    print(f"  lrf            0.1")
+    print(f"  lrf            0.01")
     print(f"  optimizer      AdamW")
     print(f"  freeze         23")
     print(f"  warmup_epochs  1")
@@ -84,13 +84,13 @@ def main():
         optimizer="AdamW",
         # 数据增强（微调时适度降低）
         hsv_h=0.0,
-        hsv_s=0.0,
-        hsv_v=0.0,
+        hsv_s=0.1,
+        hsv_v=0.2,
         degrees=0.0,
-        translate=0.0,
-        fliplr=0.0,
+        translate=0.1,
+        fliplr=0.25,
         mosaic=0.0,
-        scale=0.0,
+        scale=0.25,
         mixup=0.0,
         copy_paste=0.0,
     )
