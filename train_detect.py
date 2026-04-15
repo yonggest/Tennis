@@ -39,9 +39,9 @@ def main():
     print(f"  batch          1")
     print(f"  imgsz          1920")
     print(f"  lr0            {args.lr0}")
-    print(f"  lrf            0.01")
+    print(f"  lrf            0.1")
     print(f"  optimizer      AdamW")
-    print(f"  freeze         23")
+    print(f"  freeze         11")
     print(f"  warmup_epochs  1")
     print(f"  patience       20")
     print(f"  save_period    5")
@@ -49,7 +49,7 @@ def main():
     print(f"  plots          False")
     print(f"  cache          False")
     print(f"  augmentation   hsv_h=0  hsv_s=0.1  hsv_v=0.2  degrees=0")
-    print(f"                 translate=0.1  scale=0.25  fliplr=0.25")
+    print(f"                 translate=0.1  scale=0  fliplr=0")
     print(f"                 mosaic=0  mixup=0  copy_paste=0")
     print("─" * 60, flush=True)
 
@@ -69,8 +69,8 @@ def main():
         batch=1,
         lr0=args.lr0,
         imgsz=1920,
-        freeze=23,           # 冻结 backbone + neck，只微调 Detect head
-        lrf=0.01,            # 最终学习率 = lr0 * lrf
+        freeze=11,           # 冻结 backbone（0–10），训练 neck + head
+        lrf=0.1,             # 最终学习率 = lr0 * lrf
         warmup_epochs=1,     # freeze > 0 只训练 head 时，建议改为 1
         patience=20,         # Early stopping
         save=True,
@@ -89,9 +89,9 @@ def main():
         hsv_v=0.2,
         degrees=0.0,
         translate=0.1,
-        fliplr=0.25,
+        fliplr=0.0,
         mosaic=0.0,
-        scale=0.25,
+        scale=0.0,
         mixup=0.0,
         copy_paste=0.0,
     )
