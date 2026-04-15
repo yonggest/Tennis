@@ -208,7 +208,7 @@ cp runs/segment/<run_name>/weights/best.pt models/court_seg.pt
 | `amp` | — | True | 自动混合精度（FP16）：显著减少显存占用并加速训练，极少数情况下可能导致不稳定 |
 | `fraction` | — | 1.0 | 实际使用数据集的比例（0–1），用于快速实验 |
 | `profile` | — | False | 记录 ONNX / TensorRT 速度 benchmark 供架构对比 |
-| `freeze` | 23 | None（0） | 冻结前 N 层不更新权重。YOLO26x 共 24 层（0–23）：`freeze=23` 只训练 Detect head，`freeze=11` 训练 neck + head，`freeze=0` 全部训练 |
+| `freeze` | 11 | None（0） | 冻结前 N 层不更新权重。YOLO26x 共 24 层（0–23）：`freeze=23` 只训练 Detect head，`freeze=11` 训练 neck + head，`freeze=0` 全部训练 |
 | `max_det` | — | 300 | 每张图最多输出的检测框数 |
 | `val` | — | True | 每个 epoch 结束后在验证集上评估；False 只训练不验证 |
 | `cache` | False | False | 缓存图片到 RAM（`True`）或磁盘（`"disk"`），加速训练但占用额外内存 |
