@@ -40,6 +40,18 @@ _COURT_COLOR  = "#f0c040"
 _VOLUME_COLOR = "#00dcff"
 _LIST_W      = 80    # 左侧帧号列表宽度（像素）
 
+_TRAJ_COLORS = [
+    QColor("#00ffff"), QColor("#ff6400"), QColor("#b400ff"),
+    QColor("#00ff64"), QColor("#ffc800"), QColor("#0064ff"),
+]
+_BALL_UNTRACKED_COLOR = QColor("#804020")   # 未被 track 的网球（暗橙）
+_TRAJ_FADE_FRAMES = 60    # 轨迹淡出窗口（帧数）
+_SEARCH_DIAMETERS  = 2.0   # 搜索半径倍数，与 tracker.py 默认值一致
+_GAP_SECONDS       = 0.5   # 轨迹最大间隙时长（s），与 tracker.py _GAP_SECONDS 保持一致
+_MAX_SPEED_MS      = 70.0  # 职业发球上限（m/s），与 tracker.py 一致
+_RADIUS_MARGIN     = 1.3   # max_dist 安全裕量系数，与 tracker.py 一致
+_LINEAR_WINDOW = 4   # 预测时只使用最近 N 个历史点估计速度方向
+
 
 def _project_line(H, x1, y1, x2, y2):
     """用 H 将球场米坐标线段投影为图像像素坐标，返回 (pt1, pt2)。"""
@@ -66,11 +78,12 @@ def load_annotations(json_path: Path) -> tuple[dict, dict, dict | None]:
     frame_anns: dict[int, list] = {}
     for ann in data.get("annotations", []):
         frame_anns.setdefault(ann["image_id"], []).append({
-            "bbox":        ann["bbox"],
-            "category_id": ann["category_id"],
-            "score":       ann.get("score", 1.0),
-            "track_id":    ann.get("track_id"),
-            "valid":       ann.get("valid", True),
+            "bbox":         ann["bbox"],
+            "category_id":  ann["category_id"],
+            "score":        ann.get("score", 1.0),
+            "track_id":     ann.get("track_id"),
+            "valid":        ann.get("valid", True),
+            "interpolated": ann.get("interpolated", False),
         })
 
     court = data.get("court")
@@ -117,14 +130,30 @@ class BrowseApp(QMainWindow):
             for cid in cat_ids
         }
         self.visible_cats: set = set(cat_ids)
+        self.ball_cids: set = {cid for cid, name in categories.items()
+                               if "ball" in name.lower()}
+        # 是否来自 track 阶段：有任意球标注的 track_id != None 则为 True
+        # detected JSON 中所有 track_id 均为 None，不应把 None 视为"被追踪器拒绝"
+        self._has_tracked: bool = any(
+            ann.get("track_id") is not None
+            for anns in frame_anns.values()
+            for ann in anns
+            if ann.get("category_id") in self.ball_cids
+        )
         self.show_court: bool  = court is not None
+        self.show_traj:  bool  = True
+        self._traj          = self._build_trajectories()
 
         self.cap = cv2.VideoCapture(str(video_path))
         if not self.cap.isOpened():
             print(f"错误: 无法打开视频 {video_path}", file=sys.stderr)
             sys.exit(1)
-        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.fps          = self.cap.get(cv2.CAP_PROP_FPS) or 25.0
+        self.total_frames  = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.fps           = self.cap.get(cv2.CAP_PROP_FPS) or 25.0
+        # tracker 的 max_age（帧数），用于轨迹间隙判断和预测范围，与 tracker.py 计算方式一致
+        self._traj_max_age = max(3, round(self.fps * _GAP_SECONDS))
+        # hist=1 时的搜索门限：单帧最大球速对应的像素位移（与 tracker.py 的 effective_gate 一致）
+        self._max_dist = self._compute_max_dist()
         self.current_frame: int = -1
 
         self._current_pixmap: QPixmap | None = None
@@ -180,6 +209,18 @@ class BrowseApp(QMainWindow):
             """)
             self.court_btn.clicked.connect(self._toggle_court)
             tl.addWidget(self.court_btn)
+
+        self.traj_btn = QPushButton("  轨迹  ")
+        self.traj_btn.setCheckable(True); self.traj_btn.setChecked(True)
+        self.traj_btn.setStyleSheet("""
+            QPushButton         { background:#2a2a2a; color:#666; border:none;
+                                  padding:4px 10px; font:11pt Menlo; }
+            QPushButton:checked { background:#004040; color:#ccc;
+                                  border:1px solid #00ffff; }
+            QPushButton:hover   { background:#004040; color:white; }
+        """)
+        self.traj_btn.clicked.connect(self._toggle_traj)
+        tl.addWidget(self.traj_btn)
 
         tl.addStretch()
         self.status_lbl = QLabel("", styleSheet="color:#4ec9b0; font:11pt Menlo;")
@@ -362,29 +403,67 @@ class BrowseApp(QMainWindow):
         for z, ann in enumerate(anns_sorted):
             cid   = ann["category_id"]
             x, y, w, h = ann["bbox"]
-            valid = ann.get("valid", True)
-            color = (self.category_colors if valid else self.category_dark_colors).get(
-                cid, QColor("white"))
+            valid        = ann.get("valid", True)
+            track_id     = ann.get("track_id")
+            interpolated = ann.get("interpolated", False)
+            is_ball      = cid in self.ball_cids
 
-            pen = QPen(color, 1 if not valid else 2)
+            # ── 颜色 / 样式判断 ───────────────────────────────────────────────
+            # parse 阶段 invalid（空间过滤）→ 暗色 + X
+            if not valid:
+                color   = self.category_dark_colors.get(cid, QColor("white"))
+                special = "invalid"
+            # track 阶段未追踪（track_id=None）→ 暗橙 + X（仅在 tracked JSON 中生效）
+            elif is_ball and track_id is None and self._has_tracked:
+                color   = _BALL_UNTRACKED_COLOR
+                special = "untracked"
+            # 插值帧 → 同 track_id 颜色 + 虚线
+            elif is_ball and interpolated:
+                color   = self._traj_color(track_id)
+                special = "interpolated"
+            # 已追踪的球 → 按 track_id 着色
+            elif is_ball and track_id is not None:
+                color   = self._traj_color(track_id)
+                special = None
+            else:
+                color   = self.category_colors.get(cid, QColor("white"))
+                special = None
+
+            pen = QPen(color, 1 if special in ("invalid", "untracked") else 2)
             pen.setCosmetic(True)
+            if special == "interpolated":
+                pen.setStyle(Qt.DashLine)
+
             box = self.scene.addRect(QRectF(x, y, w, h), pen, QBrush(Qt.NoBrush))
             box.setZValue(z + 1)
 
-            if not valid:
+            if special in ("invalid", "untracked"):
                 self.scene.addLine(x, y, x + w, y + h, pen).setZValue(z + 1)
                 self.scene.addLine(x + w, y, x, y + h, pen).setZValue(z + 1)
+                if special == "untracked":
+                    score = ann.get("score")
+                    if score is not None:
+                        lbl = self.scene.addSimpleText(f"{score:.2f}", font)
+                        lbl.setBrush(QBrush(color))
+                        lbl.setPos(x, y - font_size * 1.4 if y >= font_size * 1.4 else y + h + 2)
+                        lbl.setZValue(len(anns_sorted) + z + 1)
                 continue
 
             label = self.category_labels.get(cid, "?")
             score = ann.get("score")
             if score is not None and score != 1.0:
                 label = f"{label} {score:.2f}"
+            if special == "interpolated":
+                label = f"{label} ~"
 
             txt = self.scene.addSimpleText(label, font)
             txt.setBrush(QBrush(color))
             txt.setPos(x, y - font_size * 1.4 if y >= font_size * 1.4 else y + h + 2)
             txt.setZValue(len(anns_sorted) + z + 1)
+
+        if self.show_traj and self._traj:
+            self._render_trajectories()
+            self._render_predictions()
 
         if self.show_court and self.court:
             self._render_court(font_size)
@@ -494,6 +573,134 @@ class BrowseApp(QMainWindow):
             QPointF(self._img_w * 2, floor_y),
         ])
         self.scene.addPolygon(right_poly, no_pen, mask_brush).setZValue(0.5)
+
+    def _build_trajectories(self) -> dict[int, list[tuple[int, float, float, float]]]:
+        """返回 {track_id: [(frame_idx, cx, cy, ball_d_px), ...]}，仅含已追踪（track_id != None）的网球标注。
+        ball_d_px 为检测 bbox 均值宽高，用于计算透视自适应搜索半径。
+        """
+        traj: dict[int, list] = {}
+        for frame_idx, anns in self.frame_anns.items():
+            for ann in anns:
+                tid = ann.get("track_id")
+                if tid is None or ann.get("category_id") not in self.ball_cids:
+                    continue
+                x, y, w, h = ann["bbox"]
+                cx, cy = x + w / 2, y + h / 2
+                ball_d_px = (w + h) / 2.0
+                traj.setdefault(tid, []).append((frame_idx, cx, cy, ball_d_px))
+        for pts in traj.values():
+            pts.sort(key=lambda t: t[0])
+        return traj
+
+    def _compute_max_dist(self) -> float | None:
+        """从 court keypoints + fps 推算单帧最大球速像素位移（与 tracker.py effective_gate 的 max_dist 一致）。"""
+        if not self.court:
+            return None
+        kps = self.court.get("keypoints", [])
+        if len(kps) < 4:
+            return None
+        k = np.array(kps, dtype=np.float32).reshape(-1, 2)
+        far_ppm  = float(np.linalg.norm(k[1] - k[0])) / _COURT_W
+        near_ppm = float(np.linalg.norm(k[3] - k[2])) / _COURT_W
+        px_per_meter = (far_ppm + near_ppm) / 2.0
+        return _MAX_SPEED_MS / self.fps * px_per_meter * _RADIUS_MARGIN
+
+    def _traj_color(self, track_id: int) -> QColor:
+        return _TRAJ_COLORS[track_id % len(_TRAJ_COLORS)]
+
+    def _render_trajectories(self):
+        """绘制当前帧及之前的网球轨迹线段。"""
+        cur = self.current_frame
+        for tid, pts in self._traj.items():
+            color = self._traj_color(tid)
+            pen = QPen(color, 2)
+            pen.setCosmetic(True)
+            prev = None
+            for frame_idx, cx, cy, *_ in pts:
+                if frame_idx > cur:
+                    break
+                if prev is not None:
+                    pf, px, py = prev
+                    # 仅连接相邻帧，避免跨越长间隙时画长线
+                    if frame_idx - pf <= self._traj_max_age:
+                        alpha = int(255 * max(0.2, 1.0 - (cur - frame_idx) / _TRAJ_FADE_FRAMES))
+                        c = QColor(color)
+                        c.setAlpha(alpha)
+                        p = QPen(c, 2); p.setCosmetic(True)
+                        self.scene.addLine(px, py, cx, cy, p).setZValue(10)
+                prev = (frame_idx, cx, cy)
+
+    def _render_predictions(self):
+        """为每条活动轨迹绘制预测曲线及下一帧搜索圆。
+
+        预测：最多取最近 _LINEAR_WINDOW 个点线性外推（与 tracker.py 一致）。
+
+        搜索圆半径（与 tracker.py effective_gate 保持一致）：
+          hist == 1 → self._max_dist（单帧最大球速，物理兜底）
+          hist  > 1 → _SEARCH_DIAMETERS × 最近一帧检测球径（透视自适应）
+        """
+        cur = self.current_frame
+
+        for tid, pts in self._traj.items():
+            # 取当前帧及之前的检测点（4-tuple: frame_idx, cx, cy, ball_d_px）
+            past = [p for p in pts if p[0] <= cur]
+            if not past:
+                continue
+            last_fi = past[-1][0]
+            # 超过 max_age 帧未检测到，tracker 已删除该轨迹，不再显示预测
+            if cur - last_fi > self._traj_max_age:
+                continue
+
+            color = self._traj_color(tid)
+            ts = np.array([p[0] for p in past], dtype=float)
+            xs = np.array([p[1] for p in past], dtype=float)
+            ys = np.array([p[2] for p in past], dtype=float)
+            t0    = ts[-1]
+            tn    = ts - t0
+            t_end = float(cur + 1 + self._traj_max_age - t0)
+
+            # 最多取最近 _LINEAR_WINDOW 个点（不足时取全部）线性外推
+            w = _LINEAR_WINDOW
+            deg = min(1, len(past) - 1)
+            px_coef = np.polyfit(tn[-w:], xs[-w:], deg)
+            py_coef = np.polyfit(tn[-w:], ys[-w:], deg)
+
+            # 预测曲线：从最后已知点到 cur+1+traj_max_age
+            n_pts  = max(8, min(120, int(t_end * 3)))
+            sample = np.linspace(0.0, t_end, n_pts)
+            pred_x = np.polyval(px_coef, sample)
+            pred_y = np.polyval(py_coef, sample)
+
+            pred_color = QColor(color); pred_color.setAlpha(110)
+            pred_pen   = QPen(pred_color, 1); pred_pen.setCosmetic(True)
+            pred_pen.setStyle(Qt.DotLine)
+            for i in range(n_pts - 1):
+                self.scene.addLine(
+                    float(pred_x[i]),   float(pred_y[i]),
+                    float(pred_x[i+1]), float(pred_y[i+1]),
+                    pred_pen,
+                ).setZValue(11)
+
+            # 搜索圆半径：与 tracker.py effective_gate 逻辑一致
+            if len(past) == 1 and self._max_dist is not None:
+                sr = self._max_dist
+            else:
+                sr = _SEARCH_DIAMETERS * past[-1][3]   # past[-1][3] = ball_d_px
+
+            # 下一帧预测位置的搜索圆
+            t_next  = float(cur + 1 - t0)
+            next_cx = float(np.polyval(px_coef, t_next))
+            next_cy = float(np.polyval(py_coef, t_next))
+            c_color = QColor(color); c_color.setAlpha(180)
+            c_pen   = QPen(c_color, 1); c_pen.setCosmetic(True)
+            self.scene.addEllipse(
+                next_cx - sr, next_cy - sr, sr * 2, sr * 2,
+                c_pen, QBrush(Qt.NoBrush),
+            ).setZValue(11)
+
+    def _toggle_traj(self):
+        self.show_traj = not self.show_traj
+        self._redraw()
 
     def _toggle_category(self, cat_id: int):
         if cat_id in self.visible_cats:

@@ -1,10 +1,12 @@
 """
-第二阶段：读取 detect.py 输出的全量检测 JSON，
-进行球追踪和缓冲区过滤，输出供 render.py 使用的处理后 JSON。
+第三阶段：读取 track.py 输出的 JSON（含 track_id），
+进行缓冲区过滤，输出供 render.py 使用的处理后 JSON。
+
+也可直接读取 detect.py 输出（跳过追踪阶段），此时球均视为无轨迹检测处理。
 
 用法：
-    python parse.py -i <video>.json
-    python parse.py -i <video>.json -o <video>_parsed.json
+    python parse.py -i <video>_tracked.json
+    python parse.py -i <video>_tracked.json -o <video>_parsed.json
 输出：
     <video>_parsed.json（默认）或 -o 指定的路径
 """
@@ -18,19 +20,10 @@ import cv2
 import numpy as np
 
 from utils import load_detections, save_coco
-from ball_tracker import BallTracker
-from court_detector import COURT_W as _COURT_W
 
 
-_STATIC_BALL_THRESH_PX = 5.0   # 静止球判定阈值：帧间平均位移（像素）
+_STATIC_BBOX_DIAG_PX = 20.0  # 静止球判定阈值：轨迹全局包围盒对角线（像素）
 
-
-def _px_per_meter(court_kps):
-    """从 court_kps（展平 28 维）估算像素/米比例，取远近底线宽度的平均值。"""
-    kps      = court_kps.reshape(14, 2)
-    far_ppm  = float(np.linalg.norm(kps[1] - kps[0])) / _COURT_W
-    near_ppm = float(np.linalg.norm(kps[3] - kps[2])) / _COURT_W
-    return (far_ppm + near_ppm) / 2.0
 
 
 def _in_hull(hull, x, y):
@@ -103,10 +96,17 @@ def _make_wall_quads(vol_bottom_pts, vol_top_pts, img_height):
 def _filter_balls(balls, left_wall_q, right_wall_q, volume_hull):
     """
     返回 (kept, removed)。
-    静止球（轨迹平均帧间位移 < _STATIC_BALL_THRESH_PX）必须落在立方体凸包内；
+    静止球（轨迹全局包围盒对角线 < _STATIC_BBOX_DIAG_PX）必须落在立方体凸包内；
     运动球起点落在左墙或右墙四边形内（出界）→ 整条轨迹无效。
-    无 track_id 的孤立检测视为静止球处理。
+
+    track_id 处理：
+    - 若输入来自 track.py（有任意非 None 的 track_id）：track_id=None 的检测直接移除。
+    - 若输入来自 detect.py（所有 track_id 均为 None）：按静止球处理（兼容跳过 track 的用法）。
     """
+    # 判断是否来自 track 阶段
+    has_tracked = any(d.get('track_id') is not None
+                      for frame in balls for d in frame)
+
     track_pts = defaultdict(list)
     for frame in balls:
         for d in frame:
@@ -122,9 +122,10 @@ def _filter_balls(balls, left_wall_q, right_wall_q, volume_hull):
         if len(pts) < 2:
             static_tracks.add(tid)
             continue
-        dists = [np.hypot(pts[i+1][0]-pts[i][0], pts[i+1][1]-pts[i][1])
-                 for i in range(len(pts)-1)]
-        if np.mean(dists) < _STATIC_BALL_THRESH_PX:
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        bbox_diag = np.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        if bbox_diag < _STATIC_BBOX_DIAG_PX:
             static_tracks.add(tid)
         elif (_in_hull(left_wall_q,  pts[0][0], pts[0][1]) or
               _in_hull(right_wall_q, pts[0][0], pts[0][1])):
@@ -139,7 +140,13 @@ def _filter_balls(balls, left_wall_q, right_wall_q, volume_hull):
             cy  = (d['bbox'][1] + d['bbox'][3]) / 2
             if tid in invalid_tracks:
                 r.append(d)
-            elif tid is None or tid in static_tracks:
+            elif tid is None:
+                # track 阶段已明确拒绝的检测 → 直接移除；未经 track 阶段则按静止球处理
+                if has_tracked:
+                    r.append(d)
+                else:
+                    (k if _in_hull(volume_hull, cx, cy) else r).append(d)
+            elif tid in static_tracks:
                 (k if _in_hull(volume_hull, cx, cy) else r).append(d)
             else:
                 k.append(d)
@@ -152,7 +159,7 @@ def parse_args():
     p = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument('-i', '--input',  required=True, help='detect.py 输出的 JSON 路径')
+    p.add_argument('-i', '--input',  required=True, help='track.py（或 detect.py）输出的 JSON 路径')
     p.add_argument('-o', '--output', default=None,  help='输出 JSON 路径（默认：输入同名加 _parsed）')
     if len(sys.argv) == 1:
         p.print_help()
@@ -162,7 +169,10 @@ def parse_args():
 
 def main():
     args = parse_args()
-    output_path = args.output or os.path.splitext(args.input)[0] + '_parsed.json'
+    stem = os.path.splitext(args.input)[0]
+    if stem.endswith('_tracked'):
+        stem = stem[:-len('_tracked')]
+    output_path = args.output or stem + '_parsed.json'
 
     print("─" * 60)
     print(f"  input   {args.input}")
@@ -170,9 +180,6 @@ def main():
     print("─" * 60, flush=True)
 
     fps, width, height, court, players, rackets, balls = load_detections(args.input)
-
-    # 球追踪
-    balls = BallTracker.from_video(fps, _px_per_meter(court['keypoints'])).run(balls)
 
     # 缓冲区过滤
     ground_hull = court['ground_hull']

@@ -5,7 +5,7 @@
     python detect.py -i <video>
     python detect.py -i <video> -o results/my.json -m models/yolo26x.pt -s models/court_seg.pt
 输出：
-    <video>.json（默认）或 -o 指定的路径
+    <video>_detected.json（默认）或 -o 指定的路径
 """
 
 import argparse
@@ -30,7 +30,7 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument('-i', '--input',        required=True,                help='输入视频路径')
-    p.add_argument('-o', '--output',        default=None,                 help='输出 JSON 路径（默认：输入同名，后缀改为 .json）')
+    p.add_argument('-o', '--output',        default=None,                 help='输出 JSON 路径（默认：输入同名加 _detected）')
     p.add_argument('-m', '--object-model', default='models/yolo26x.pt',  help='物体检测模型路径（球员/球拍/球）')
     p.add_argument('-s', '--court-model',  default='models/court_seg.pt', help='球场分割模型路径')
     p.add_argument('-c', '--conf',         type=float, default=0.5,      help='检测置信度阈值')
@@ -44,7 +44,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    output_path = args.output or os.path.splitext(args.input)[0] + '.json'
+    output_path = args.output or os.path.splitext(args.input)[0] + '_detected.json'
 
     print("─" * 60)
     print(f"  input         {args.input}")

@@ -1,5 +1,5 @@
 """
-第三阶段：读取 parse.py 输出的处理后 JSON，逐帧流式处理原始视频，输出注释视频。
+第四阶段：读取 parse.py 输出的处理后 JSON，逐帧流式处理原始视频，输出注释视频。
 
 用法：
     python render.py -i <video> -j <video>.json           # detect.py 输出（无过滤/追踪）
