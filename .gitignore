@@ -4,8 +4,9 @@ __pycache__/
 *.pyo
 
 # Models (large binary files, download separately)
-models/
+models/*
 !models/put_models_here.txt
+!models/yolo26x.pt
 
 # Output videos and debug images
 output_videos/
