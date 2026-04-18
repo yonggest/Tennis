@@ -2,10 +2,10 @@
 第二阶段：读取 detect.py 输出的 JSON，对球员和网球进行追踪，输出含 track_id 的 JSON。
 
 用法：
-    python track.py -i <video>_detected.json
-    python track.py -i <video>_detected.json -o <video>_tracked.json
+    python track.py -i <video>.detected.json
+    python track.py -i <video>.detected.json -o <video>.tracked.json
 输出：
-    <video>_tracked.json（默认，去掉 _detected 后缀后加 _tracked）
+    <video>.tracked.json（默认，去掉 _detected 后缀后加 _tracked）
 """
 
 import argparse
@@ -15,7 +15,7 @@ import sys
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
-from utils import load_detections, save_coco, iter_frames
+from utils import load_detections, save_coco, iter_frames, propagate_video
 from tracker import BallTracker, PlayerTracker, RacketTracker
 from court_detector import COURT_W as _COURT_W
 
@@ -127,9 +127,9 @@ def parse_args():
 def main():
     args = parse_args()
     stem = os.path.splitext(args.input)[0]
-    if stem.endswith('_detected'):
-        stem = stem[:-len('_detected')]
-    output_path = args.output or stem + '_tracked.json'
+    if stem.endswith('.detected'):
+        stem = stem[:-len('.detected')]
+    output_path = args.output or stem + '.tracked.json'
 
     print("─" * 60)
     print(f"  input      {args.input}")
@@ -176,7 +176,8 @@ def main():
     ).run(balls, debug_frame=args.debug_frame)
 
     save_coco(width, height, players, rackets, balls,
-              output_path, fps=fps, court=court)
+              output_path, fps=fps, court=court,
+              video=propagate_video(args.input, output_path))
 
 
 if __name__ == '__main__':

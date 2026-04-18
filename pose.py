@@ -3,10 +3,10 @@
 将关键点附加到匹配的有效球员检测上，输出新的 COCO JSON。
 
 用法：
-    python pose.py -i <video>_parsed.json -v <video>
-    python pose.py -i <video>_parsed.json -v <video> -o <video>_posed.json
+    python pose.py -i <video>.parsed.json -v <video>
+    python pose.py -i <video>.parsed.json -v <video> -o <video>.posed.json
 输出：
-    <video>_posed.json（默认：将 _parsed 后缀替换为 _posed）
+    <video>.posed.json（默认：将 _parsed 后缀替换为 _posed）
 """
 
 import argparse
@@ -17,7 +17,7 @@ import time
 import numpy as np
 from ultralytics import YOLO
 
-from utils import iter_frames, load_detections, save_coco, video_info
+from utils import iter_frames, load_detections, save_coco, video_info, load_video_path, propagate_video
 
 
 def _iou(a, b):
@@ -44,9 +44,9 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument('-i', '--input',  required=True,
-                   help='parse.py 输出的 JSON 路径（_parsed.json）')
-    p.add_argument('-v', '--video',  required=True,
-                   help='原始视频路径')
+                   help='parse.py 输出的 JSON 路径（.parsed.json）')
+    p.add_argument('-v', '--video',  default=None,
+                   help='原始视频路径（默认：从 JSON 的 video 字段读取）')
     p.add_argument('-m', '--model',  default='models/yolo26x-pose.pt',
                    help='YOLO 姿态估计模型路径')
     p.add_argument('-o', '--output', default=None,
@@ -59,17 +59,23 @@ def parse_args():
 
 def _default_output(input_path):
     base = input_path
-    if base.endswith('_parsed.json'):
-        base = base[:-len('_parsed.json')] + '_posed.json'
+    if base.endswith('.parsed.json'):
+        base = base[:-len('.parsed.json')] + '.posed.json'
     else:
         root, _ = os.path.splitext(base)
-        base = root + '_posed.json'
+        base = root + '.posed.json'
     return base
 
 
 def main():
     args = parse_args()
     output_path = args.output or _default_output(args.input)
+
+    if args.video is None:
+        args.video = load_video_path(args.input)
+    if args.video is None:
+        print("错误: 未指定 -v，且 JSON 中未包含 video 字段", file=sys.stderr)
+        sys.exit(1)
 
     print("─" * 60)
     print(f"  input       {args.input}")
@@ -136,7 +142,8 @@ def main():
     print(f"[   pose] {total_with_kps} players with keypoints", flush=True)
 
     # ── 保存 ───────────────────────────────────────────────────────────────────
-    save_coco(width, height, players, rackets, balls, output_path, fps=fps, court=court)
+    save_coco(width, height, players, rackets, balls, output_path, fps=fps, court=court,
+              video=propagate_video(args.input, output_path))
 
 
 if __name__ == '__main__':

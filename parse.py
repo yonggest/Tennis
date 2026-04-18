@@ -5,10 +5,10 @@
 也可直接读取 detect.py 输出（跳过追踪阶段），此时球均视为无轨迹检测处理。
 
 用法：
-    python parse.py -i <video>_tracked.json
-    python parse.py -i <video>_tracked.json -o <video>_parsed.json
+    python parse.py -i <video>.tracked.json
+    python parse.py -i <video>.tracked.json -o <video>.parsed.json
 输出：
-    <video>_parsed.json（默认）或 -o 指定的路径
+    <video>.parsed.json（默认）或 -o 指定的路径
 """
 
 import argparse
@@ -19,7 +19,7 @@ from collections import defaultdict
 import cv2
 import numpy as np
 
-from utils import load_detections, save_coco
+from utils import load_detections, save_coco, propagate_video
 
 
 _STATIC_BBOX_DIAG_PX = 20.0  # 静止球判定阈值：轨迹全局包围盒对角线（像素）
@@ -170,9 +170,9 @@ def parse_args():
 def main():
     args = parse_args()
     stem = os.path.splitext(args.input)[0]
-    if stem.endswith('_tracked'):
-        stem = stem[:-len('_tracked')]
-    output_path = args.output or stem + '_parsed.json'
+    if stem.endswith('.tracked'):
+        stem = stem[:-len('.tracked')]
+    output_path = args.output or stem + '.parsed.json'
 
     print("─" * 60)
     print(f"  input   {args.input}")
@@ -207,7 +207,8 @@ def main():
                    [dict(d, valid=False) for d in balls_inv[fi]] for fi in range(n)]
 
     save_coco(width, height, players_out, rackets_out, balls_out,
-              output_path, fps=fps, court=court)
+              output_path, fps=fps, court=court,
+              video=propagate_video(args.input, output_path))
 
 
 if __name__ == '__main__':

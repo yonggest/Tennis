@@ -3,7 +3,7 @@
 
 用法：
     python render.py -i <video> -j <video>.json           # detect.py 输出（无过滤/追踪）
-    python render.py -i <video> -j <video>_parsed.json   # parse.py 输出（含过滤/追踪）
+    python render.py -i <video> -j <video>.parsed.json   # parse.py 输出（含过滤/追踪）
     python render.py -i <video> -j <video>.json -o output.mp4
 输出：
     <video>.mp4（默认，输入为 .mp4 时需用 -o 指定不同路径）
@@ -20,7 +20,7 @@ from collections import defaultdict
 import cv2
 import numpy as np
 
-from utils import video_info, iter_frames, open_video_writer, load_detections, text_params
+from utils import video_info, iter_frames, open_video_writer, load_detections, text_params, load_video_path
 from court_detector import (COURT_LINES, COURT_W as _COURT_W, NET_Y as _NET_Y,
                              compute_H_from_kps)
 
@@ -313,7 +313,7 @@ def parse_args():
     p = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument('-i', '--input',      required=True,               help='原始输入视频路径')
+    p.add_argument('-i', '--input',      default=None,                help='原始输入视频路径（默认：从 JSON 的 video 字段读取）')
     p.add_argument('-j', '--json',       required=True,               help='detect.py 或 parse.py 输出的 JSON 路径')
     p.add_argument('-o', '--output',     default=None,                help='输出视频路径（默认：输入视频同名 .mp4）')
     if len(sys.argv) == 1:
@@ -324,6 +324,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.input is None:
+        args.input = load_video_path(args.json)
+    if args.input is None:
+        print("错误: 未指定 -i，且 JSON 中未包含 video 字段", file=sys.stderr)
+        sys.exit(1)
     output_path = args.output or os.path.splitext(args.input)[0] + '.mp4'
     if os.path.abspath(output_path) == os.path.abspath(args.input):
         print(f"错误: 输出路径与输入路径相同: {output_path}", file=sys.stderr)

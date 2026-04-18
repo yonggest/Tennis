@@ -5,7 +5,7 @@
     python detect.py -i <video>
     python detect.py -i <video> -o results/my.json -m models/yolo26x.pt -s models/court_seg.pt
 输出：
-    <video>_detected.json（默认）或 -o 指定的路径
+    <video>.detected.json（默认）或 -o 指定的路径
 """
 
 import argparse
@@ -44,7 +44,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    output_path = args.output or os.path.splitext(args.input)[0] + '_detected.json'
+    output_path = args.output or os.path.splitext(args.input)[0] + '.detected.json'
 
     print("─" * 60)
     print(f"  input         {args.input}")
@@ -88,8 +88,12 @@ def main():
         total=n_frames,
     )
 
+    video_rel = os.path.relpath(
+        os.path.abspath(args.input),
+        os.path.dirname(os.path.abspath(output_path)),
+    )
     save_coco(width, height, players, rackets, balls, output_path,
-              fps=fps, court=court)
+              fps=fps, court=court, video=video_rel)
 
     n_players = sum(len(v) for v in players)
     n_rackets = sum(len(v) for v in rackets)

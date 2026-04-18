@@ -101,7 +101,7 @@ def _deserialize_court(raw):
     }
 
 
-def save_coco(width, height, players, rackets, balls, path, fps=None, court=None):
+def save_coco(width, height, players, rackets, balls, path, fps=None, court=None, video=None):
     """
     将检测结果保存为 COCO JSON。
 
@@ -153,10 +153,33 @@ def save_coco(width, height, players, rackets, balls, path, fps=None, court=None
         result['fps'] = fps
     if court is not None:
         result['court'] = _serialize_court(court)
+    if video is not None:
+        result['video'] = video
 
     with open(path, 'w') as f:
         json.dump(result, f, indent=2)
     print(f"[    coco] saved → {path}  ({annotation_id} annotations, {len(images)} frames)", flush=True)
+
+
+def load_video_path(json_path):
+    """从 JSON 读取 video 字段，返回绝对路径（字段不存在则返回 None）。"""
+    with open(json_path) as f:
+        rel = json.load(f).get('video')
+    if rel is None:
+        return None
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(json_path)), rel))
+
+
+def propagate_video(from_json_path, to_json_path):
+    """从 from_json 读取 video 字段，转换为相对于 to_json 目录的路径（不存在则返回 None）。"""
+    with open(from_json_path) as f:
+        rel = json.load(f).get('video')
+    if rel is None:
+        return None
+    from_dir = os.path.dirname(os.path.abspath(from_json_path))
+    to_dir   = os.path.dirname(os.path.abspath(to_json_path))
+    abs_path = os.path.normpath(os.path.join(from_dir, rel))
+    return os.path.relpath(abs_path, to_dir)
 
 
 def load_detections(path):
