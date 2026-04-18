@@ -755,7 +755,7 @@ class BrowseApp(QMainWindow):
         px_per_meter = (far_ppm + near_ppm) / 2.0
         return _MAX_SPEED_MS / self.fps * px_per_meter * _RADIUS_MARGIN
 
-    def _traj_color(self, track_id: int) -> QColor:
+    def _ball_traj_color(self, track_id: int) -> QColor:
         return _BALL_TRAJ_COLORS[track_id % len(_BALL_TRAJ_COLORS)]
 
     def _render_ball_trajectories(self):
